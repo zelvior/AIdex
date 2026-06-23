@@ -1,0 +1,10 @@
+# Nexus AI Coding Agent — Dependencies
+# Install: pip install -r requirements.txt
+
+# Required
+rich>=10.0.0
+prompt_toolkit>=3.0.0
+
+# Optional (for faster HTTP, not required — stdlib urllib is used by default)
+# httpx>=0.20.0
+# requests>=2.26.0
