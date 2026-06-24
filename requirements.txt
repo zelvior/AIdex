@@ -1,0 +1,18 @@
+# AIdex AI Coding Agent — Dependencies
+# Install: pip install -r requirements.txt
+#
+# These are OPTIONAL. AIdex runs with zero dependencies using its
+# built-in plain-text interface (src/tui/plain.py), which works on
+# Python 2.7+ including Windows XP and 32-bit systems.
+#
+# Installing the packages below enables the enhanced Rich UI
+# (syntax highlighting, live rendering, auto-complete). Requires
+# Python 3.7+.
+
+# Optional — enhanced UI (auto-detected, falls back gracefully if missing)
+rich>=10.0.0
+prompt_toolkit>=3.0.0
+
+# Optional (for faster HTTP, not required — stdlib urllib is used by default)
+# httpx>=0.20.0
+# requests>=2.26.0
