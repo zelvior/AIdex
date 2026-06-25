@@ -33,7 +33,7 @@ SYSTEM_PROMPT = """You are AIdex, a professional AI coding agent. You help users
 - Explaining code and concepts
 
 ## Tool Usage
-When you need to perform file operations, run commands, or use any tools, output them in this EXACT format:
+Tools are available to you as native function calls — use them directly rather than describing them in text. If native function calling is unavailable for the current model, fall back to emitting this exact text format instead:
 
 <tool_call>
 {
@@ -68,6 +68,39 @@ TOOL_SUMMARY = "\n".join(
 )
 
 
+def normalize_message_content(msg: Dict) -> str:
+    """Render any message's content as a display string, regardless of
+    whether it's a plain string (legacy/text), None with tool_calls
+    (OpenAI native tool request), a list of content blocks (Anthropic
+    native tool request/result), or a 'tool' role result message."""
+    content = msg.get("content")
+    role = msg.get("role", "")
+
+    if content is None and msg.get("tool_calls"):
+        names = ", ".join(tc.get("function", {}).get("name", "?") for tc in msg["tool_calls"])
+        return f"[calling tool(s): {names}]"
+
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            btype = block.get("type")
+            if btype == "text":
+                parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                parts.append(f"[calling tool: {block.get('name', '?')}]")
+            elif btype == "tool_result":
+                out = block.get("content", "")
+                parts.append(f"[tool result]\n{out}")
+            else:
+                parts.append(str(block))
+        return "\n".join(parts)
+
+    if role == "tool":
+        return f"[tool result: {msg.get('name', '?')}]\n{content or ''}"
+
+    return content or ""
+
+
 class Agent:
     def __init__(self):
         self.messages: List[Dict] = []
@@ -99,10 +132,13 @@ class Agent:
         )
 
     def _build_system(self) -> str:
-        return SYSTEM_PROMPT.format(
-            tools=TOOL_SUMMARY,
-            workspace=config.workspace,
-        )
+        # Plain .replace() instead of .format(): the prompt template
+        # contains literal JSON braces in its fallback example, and any
+        # future edit that reintroduces unescaped {...} would silently
+        # break every single chat call if .format() were used here again.
+        return (SYSTEM_PROMPT
+                .replace("{tools}", TOOL_SUMMARY)
+                .replace("{workspace}", config.workspace))
 
     def _parse_tool_calls(self, text: str) -> List[Dict]:
         """Extract <tool_call>...</tool_call> blocks from AI response."""
@@ -129,8 +165,33 @@ class Agent:
                     calls.append({"tool": tool_name, "params": params})
         return calls
 
+    def _list_models_tool(self, provider: Optional[str], free_only: bool, refresh: bool) -> ToolResult:
+        """Live model listing for the AI itself to consult (e.g. when asked
+        to recommend a cheaper/free model)."""
+        try:
+            models, source = config.get_live_models(provider, force_refresh=refresh)
+            if free_only:
+                models = [m for m in models if m.is_free]
+            lines = ["[Source: %s]" % source]
+            for m in models[:60]:
+                lines.append("  %s | ctx=%s | %s" % (m.id, m.context_label(), m.price_label()))
+            if len(models) > 60:
+                lines.append("  ... and %d more" % (len(models) - 60))
+            return ToolResult(True, "\n".join(lines))
+        except Exception as e:
+            return ToolResult(False, "", str(e))
+
+    def run_tool(self, tool_name: str, params: Dict) -> ToolResult:
+        """Public entry point for running a single tool directly, without
+        going through the chat loop (used by the web UI's file browser,
+        and available for any other external caller)."""
+        return self._execute_tool(tool_name, params)
+
     def _execute_tool(self, tool_name: str, params: Dict) -> ToolResult:
         """Execute a named tool with given parameters."""
+        if tool_name in getattr(self, "_excluded_tools", set()):
+            return ToolResult(False, "", f"Tool '{tool_name}' is disabled for this session.")
+
         ws = config.workspace
         safe = config.get("safe_mode", True)
 
@@ -148,7 +209,7 @@ class Agent:
             "search_files": lambda p: search_files(p["pattern"], p.get("path", "."), ws, p.get("content", False)),
             "grep_file": lambda p: grep_file(p["path"], p["pattern"], ws, p.get("is_regex", False)),
             "run_command": lambda p: run_command(p["cmd"], ws, int(p.get("timeout", 60)), safe),
-            "run_python": lambda p: run_python(p["code"], ws),
+            "run_python": lambda p: run_python(p["code"], ws, safe),
             "git_status": lambda p: git_status(ws),
             "git_diff": lambda p: git_diff(ws, p.get("file", "")),
             "git_log": lambda p: git_log(ws, int(p.get("n", 10))),
@@ -169,6 +230,9 @@ class Agent:
                 p["pattern"], p["replacement"], p.get("file_glob", "*"), ws, bool(p.get("dry_run", True))
             ),
             "which": lambda p: which(p["name"]),
+            "list_models": lambda p: self._list_models_tool(
+                p.get("provider"), bool(p.get("free_only", False)), bool(p.get("refresh", False))
+            ),
         }
 
         fn = dispatch.get(tool_name)
@@ -181,7 +245,7 @@ class Agent:
         except Exception as e:
             return ToolResult(False, "", f"Tool error: {e}")
 
-    def chat_stream(self, user_input: str) -> Iterator[Tuple[str, str]]:
+    def chat_stream(self, user_input: str, excluded_tools: Optional[set] = None) -> Iterator[Tuple[str, str]]:
         """
         Stream a response. Yields (type, content) tuples:
           ("text", chunk)       - AI text
@@ -189,11 +253,19 @@ class Agent:
           ("tool_result", out)  - tool output
           ("error", msg)        - error
           ("done", "")          - finished
+
+        Uses native provider function-calling (OpenAI-style tools= for
+        OpenRouter/Groq/OpenAI/Ollama, Anthropic's own tool format for
+        Anthropic) when the provider supports it — far more reliable than
+        asking the model to emit a specific text pattern. Falls back to the
+        legacy <tool_call> text-parsing only for providers/models that don't
+        support native tools or that ignore them and answer in plain text.
+        Runs a real multi-turn loop: tool results are fed back to the model
+        so it can react to them, up to a safety cap on iterations.
         """
         self.messages.append({"role": "user", "content": user_input})
 
         sys_msgs = [{"role": "system", "content": self._build_system()}]
-        all_msgs = sys_msgs + self.messages
 
         try:
             provider = self._get_provider()
@@ -201,56 +273,135 @@ class Agent:
             yield ("error", str(e))
             return
 
-        # Collect full AI response (streaming)
-        full_response = ""
-        try:
-            stream = provider.chat(
-                all_msgs,
-                stream=True,
-                max_tokens=config.get("max_tokens", 4096),
-                temperature=config.get("temperature", 0.7),
-            )
-            for chunk in stream:
-                full_response += chunk
-                yield ("text", chunk)
-        except ProviderError as e:
-            yield ("error", str(e))
-            return
-        except Exception as e:
-            yield ("error", f"Unexpected error: {e}")
-            return
+        native = getattr(provider, "supports_native_tools", False)
+        is_anthropic = provider.__class__.__name__ == "AnthropicProvider"
+        self._excluded_tools = excluded_tools or set()
+        if native:
+            from src.tools.file_tools import build_anthropic_tools_schema, build_openai_tools_schema
+            tools_schema = build_anthropic_tools_schema() if is_anthropic else build_openai_tools_schema()
+            if excluded_tools:
+                if is_anthropic:
+                    tools_schema = [t for t in tools_schema if t["name"] not in excluded_tools]
+                else:
+                    tools_schema = [t for t in tools_schema if t["function"]["name"] not in excluded_tools]
+        else:
+            tools_schema = None
 
-        # Parse and execute tool calls
-        tool_calls = self._parse_tool_calls(full_response)
-        tool_results_text = ""
+        max_turns = 8  # safety cap against infinite tool-call loops
+        for _turn in range(max_turns):
+            all_msgs = sys_msgs + self.messages
+            full_text = ""
+            native_calls: List[Dict] = []
 
-        for call in tool_calls:
-            tool_name = call.get("tool", "")
-            params = call.get("params", {})
+            try:
+                stream = provider.chat(
+                    all_msgs,
+                    stream=True,
+                    max_tokens=config.get("max_tokens", 4096),
+                    temperature=config.get("temperature", 0.7),
+                    tools=tools_schema,
+                )
+                for piece in stream:
+                    if isinstance(piece, dict):
+                        if piece.get("type") == "text":
+                            full_text += piece["text"]
+                            yield ("text", piece["text"])
+                        elif piece.get("type") == "tool_calls":
+                            native_calls = piece.get("tool_calls", [])
+                    else:
+                        # Defensive: a provider that still yields bare strings
+                        full_text += piece
+                        yield ("text", piece)
+            except ProviderError as e:
+                yield ("error", str(e))
+                return
+            except Exception as e:
+                yield ("error", f"Unexpected error: {e}")
+                return
 
-            if self._on_tool_call:
-                self._on_tool_call(tool_name, params)
-            yield ("tool_call", tool_name)
+            calls_to_run = []
+            if native_calls:
+                for c in native_calls:
+                    calls_to_run.append({"id": c.get("id", ""), "tool": c.get("name", ""), "params": c.get("arguments", {})})
+            else:
+                # Fallback: legacy text-embedded <tool_call> blocks, for
+                # models that ignore the native tools= parameter.
+                for c in self._parse_tool_calls(full_text):
+                    calls_to_run.append({"id": "", "tool": c.get("tool", ""), "params": c.get("params", {})})
 
-            result = self._execute_tool(tool_name, params)
-            result_str = str(result)
+            if not calls_to_run:
+                self.messages.append({"role": "assistant", "content": full_text})
+                yield ("done", "")
+                return
 
-            if self._on_tool_result:
-                self._on_tool_result(tool_name, result)
-            yield ("tool_result", result_str)
-            tool_results_text += f"\n[Tool: {tool_name}]\n{result_str}\n"
+            # Record the assistant turn that requested the tool call(s).
+            if native_calls:
+                if is_anthropic:
+                    content_blocks = []
+                    if full_text:
+                        content_blocks.append({"type": "text", "text": full_text})
+                    for c in native_calls:
+                        content_blocks.append({
+                            "type": "tool_use", "id": c.get("id", ""),
+                            "name": c.get("name", ""), "input": c.get("arguments", {}),
+                        })
+                    self.messages.append({"role": "assistant", "content": content_blocks})
+                else:
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": full_text or None,
+                        "tool_calls": [
+                            {"id": c.get("id", ""), "type": "function",
+                             "function": {"name": c.get("name", ""), "arguments": json.dumps(c.get("arguments", {}))}}
+                            for c in native_calls
+                        ],
+                    })
+            else:
+                self.messages.append({"role": "assistant", "content": full_text})
 
-        # Add assistant message to history
-        final_content = full_response
-        if tool_results_text:
-            final_content += tool_results_text
+            tool_outputs = []
+            for call in calls_to_run:
+                tool_name = call["tool"]
+                params = call["params"]
 
-        self.messages.append({
-            "role": "assistant",
-            "content": final_content
-        })
+                if self._on_tool_call:
+                    self._on_tool_call(tool_name, params)
+                yield ("tool_call", tool_name)
 
-        yield ("done", "")
+                result = self._execute_tool(tool_name, params)
+                result_str = str(result)
+
+                if self._on_tool_result:
+                    self._on_tool_result(tool_name, result)
+                yield ("tool_result", result_str)
+                tool_outputs.append((call["id"], tool_name, result_str))
+
+            # Feed tool results back so the model can react to them.
+            if native_calls:
+                self._append_native_tool_results(tool_outputs, is_anthropic)
+            else:
+                summary = "\n".join(f"[Tool: {name}]\n{out}" for _id, name, out in tool_outputs)
+                self.messages.append({"role": "user", "content": summary})
+
+        yield ("error", "Stopped after too many tool-call turns (possible loop). "
+                         "Try rephrasing your request.")
+
+    def _append_native_tool_results(self, tool_outputs, is_anthropic: bool):
+        """Append tool results to history in the format each native tool
+        protocol expects, so the next turn's request is well-formed."""
+        if is_anthropic:
+            content = []
+            for call_id, _name, out in tool_outputs:
+                content.append({"type": "tool_result", "tool_use_id": call_id, "content": out})
+            self.messages.append({"role": "user", "content": content})
+        else:
+            for call_id, name, out in tool_outputs:
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "content": out,
+                })
 
     def chat_sync(self, user_input: str) -> str:
         """Non-streaming chat, returns full response string."""

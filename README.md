@@ -6,11 +6,16 @@
  / __ | _/ // _  / -_) \ /
 /_/ |_|/___/\_,_/\__/_\_\
 
-   Professional CLI AI Coding Agent v1.1.0
+   Professional CLI AI Coding Agent v1.2.0
 ```
 
 > Formerly known as **Nexus**. Renamed to **AIdex**. Old `nexus.py` /
 > `nexus`/`nexus.bat` launchers and config still work — see Migration below.
+
+> 🧠 **Contributing or picking this project back up?** Read
+> [`BRAIN.md`](BRAIN.md) first — it's a dense project-context file
+> (architecture, tool system, web security model, API reference, known
+> design decisions) meant to replace re-reading the whole codebase.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-2.7%2B%20%2F%203.6%2B-green.svg)]()
@@ -42,6 +47,9 @@ AIdex is built to run **everywhere** — from a fresh Windows 11 64-bit machine 
 - 🐢 **Low-End Friendly**: Memory-bounded file tools (`tail_file`, `head_file`, `read_file_lines`) for huge files on limited RAM
 - 🔌 **Offline Mode**: Use Ollama for a fully local AI with no internet connection
 - 🔁 **Auto-Retry**: Network requests retry with backoff on transient failures
+- 🌐 **Web UI**: Full browser interface — chat, file browser/editor, live model pricing — served locally with zero extra dependencies
+- 🛠️ **Native Tool Calling**: Real function-calling for OpenRouter/Groq/OpenAI/Ollama/Anthropic, with multi-turn tool-result loops, not text-pattern guessing
+- 📡 **Live Model Pricing**: Real-time model lists with actual pricing and context length, cached for offline use
 
 ---
 
@@ -83,7 +91,33 @@ python3 aidex.py
 ```bash
 python aidex.py --plain   # zero-dependency text UI (XP, 32-bit, minimal Python)
 python aidex.py --full    # Rich/prompt_toolkit UI (requires those packages)
+python aidex.py --web     # browser-based UI (opens automatically)
 ```
+
+---
+
+## 🌐 Web UI
+
+```bash
+python aidex.py --web                       # opens in your default browser
+python aidex.py --web --port 9000           # specific port
+python aidex.py --web --no-browser          # don't auto-open a tab
+```
+
+Runs entirely on `127.0.0.1` (your own machine) using a zero-dependency
+stdlib HTTP server — no Flask, no extra `pip install`. It's the same
+Agent/Config/provider code as the terminal app, just with a browser
+front end:
+
+- **Chat** with streaming responses and visible tool-call cards (click to expand the output)
+- **Files** — browse, open, and edit files in your workspace
+- **Models** — live pricing/context/free-tier table, searchable and sortable, click to switch
+- **Settings** — API keys (masked, stored locally only), workspace, safe mode, temperature
+
+For safety, the web UI confines file access to your configured workspace
+(no escaping via `/etc/passwd`-style absolute paths or `../` traversal)
+and does **not** let the AI run shell commands or Python code through the
+browser unless you explicitly opt in via `web_allow_shell_tools` in config.
 
 ---
 
@@ -218,15 +252,19 @@ aidex/
 ├── CHANGELOG.md
 └── src/
     ├── core/
-    │   ├── agent.py      ← AI agent orchestrator
-    │   └── config.py     ← Configuration manager
+    │   ├── agent.py      ← AI agent orchestrator, native tool-calling loop
+    │   ├── config.py     ← Configuration manager
+    │   └── models.py     ← Live model registry (fetch/cache/fallback)
     ├── providers/
     │   └── base.py       ← OpenRouter, Groq, Anthropic, OpenAI, Ollama
     ├── tools/
     │   └── file_tools.py ← All file/shell/git tools
-    └── tui/
-        ├── app.py        ← Enhanced UI (Rich + prompt_toolkit)
-        └── plain.py      ← Zero-dependency fallback UI (Python 2.7+)
+    ├── tui/
+    │   ├── app.py        ← Enhanced UI (Rich + prompt_toolkit)
+    │   └── plain.py      ← Zero-dependency fallback UI (Python 2.7+)
+    └── web/
+        ├── server.py     ← Stdlib-only local web server (REST + SSE chat)
+        └── static/       ← Browser UI (HTML/CSS/JS, no build step)
 ```
 
 ---
@@ -235,6 +273,13 @@ aidex/
 
 Safe mode (enabled by default) blocks destructive commands like `rm -rf /`.
 Toggle with `/safemode`. When OFF, all commands execute without restriction.
+
+In the **web UI**, shell command and Python execution tools are disabled
+for the AI by default regardless of safe mode, since a browser-reachable
+endpoint is a different trust boundary than your own terminal. Set
+`web_allow_shell_tools: true` in your config file to allow them there too.
+File access from the web UI is always confined to your configured
+workspace — absolute paths and `../` traversal outside it are rejected.
 
 ---
 

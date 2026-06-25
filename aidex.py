@@ -15,6 +15,11 @@ Usage:
     python aidex.py --plain    Force the zero-dependency plain interface
     python aidex.py --full     Force the Rich/prompt_toolkit interface
                                 (errors if those packages are unavailable)
+    python aidex.py --web      Launch the local web UI in your browser
+                                (stdlib-only HTTP server, no extra deps)
+    python aidex.py --web --no-browser --port 9000
+                                Web UI without auto-opening a browser tab,
+                                on a specific port
 """
 
 from __future__ import print_function
@@ -37,6 +42,18 @@ def _want_full():
     return "--full" in sys.argv
 
 
+def _want_web():
+    return "--web" in sys.argv
+
+
+def _arg_value(flag, default=None):
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return default
+
+
 def _run_plain():
     from tui.plain import main as plain_main
     plain_main()
@@ -48,7 +65,27 @@ def _run_full():
     app.run()
 
 
+def _run_web():
+    if sys.version_info[0] < 3 or (sys.version_info[0] == 3 and sys.version_info[1] < 6):
+        sys.stderr.write(
+            "The web UI needs Python 3.6+. This system has %d.%d.\n"
+            "Use 'python aidex.py --plain' instead for the zero-dependency "
+            "terminal interface, which works on older Python.\n"
+            % (sys.version_info[0], sys.version_info[1])
+        )
+        sys.exit(1)
+    from web.server import run_web_server
+    port = _arg_value("--port")
+    port = int(port) if port else None
+    open_browser = "--no-browser" not in sys.argv
+    run_web_server(port=port, open_browser=open_browser)
+
+
 def main():
+    if _want_web():
+        _run_web()
+        return
+
     forced_plain = _want_plain()
     forced_full = _want_full()
 

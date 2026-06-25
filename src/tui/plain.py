@@ -22,7 +22,7 @@ try:
 except NameError:
     string_types = (str,)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 BANNER = r"""
    ___    ____    __
@@ -105,8 +105,8 @@ def out(text=""):
 COMMANDS = [
     ("/help", "Show this help"),
     ("/config", "Configure API key, provider, model, workspace"),
-    ("/models", "List available models"),
-    ("/model <name>", "Switch model"),
+    ("/models", "List live models (try: /models free, /models sort price, /models refresh)"),
+    ("/model <name>", "Switch model (fuzzy-matched against live list)"),
     ("/provider <name>", "Switch provider (openrouter/groq/anthropic/openai/ollama)"),
     ("/workspace <path>", "Change workspace directory"),
     ("/clear", "Clear conversation history"),
@@ -176,19 +176,84 @@ def show_status(config, agent):
     out("")
 
 
-def show_models(config):
+def _parse_models_args(arg):
+    """Parse '/models <free|refresh|sort X|search terms>' into
+    (query, sort_by, free_only, refresh). Mirrors app.py's parser."""
+    tokens = arg.split()
+    query_parts = []
+    sort_by = "name"
+    free_only = False
+    refresh = False
+    i = 0
+    while i < len(tokens):
+        t = tokens[i].lower()
+        if t == "free":
+            free_only = True
+        elif t == "refresh":
+            refresh = True
+        elif t == "sort" and i + 1 < len(tokens):
+            sort_by = tokens[i + 1].lower()
+            i += 1
+        else:
+            query_parts.append(tokens[i])
+        i += 1
+    return " ".join(query_parts), sort_by, free_only, refresh
+
+
+def show_models(config, query="", sort_by="name", free_only=False, refresh=False):
+    from src.core.models import filter_models, sort_models
+
+    provider = config.provider
     info = config.get_provider_info()
-    free = info.get("free_models", [])
-    paid = info.get("paid_models", [])
-    out(cyan("Models - %s" % info.get("name", config.provider)))
-    for m in free:
-        mark = "*" if m == config.model else " "
-        out(" %s %s [FREE]" % (mark, m))
-    for m in paid:
-        mark = "*" if m == config.model else " "
-        out(" %s %s [PAID]" % (mark, m))
-    out(dim("* = current model"))
+    pname = info.get("name", provider)
+
+    out(dim("Fetching live models for %s..." % pname))
+    models, source = config.get_live_models(force_refresh=refresh)
+    shown = sort_models(filter_models(models, query, free_only), sort_by)
+
+    source_label = {
+        "live": "live",
+        "cache": "cached",
+        "stale-cache": "cached (stale, refetch failed)",
+        "static-fallback": "built-in fallback (no network/cache)",
+    }.get(source, source)
+    age = config.models_cache_age() if source != "live" else "just now"
+
+    title = "Models - %s" % pname
+    if query:
+        title += "  (filter: '%s')" % query
+    out(cyan(title))
+    for m in shown[:80]:
+        mark = "*" if m.id == config.model else " "
+        tools_mark = " tools=yes" if m.supports_tools else ("" if m.supports_tools is None else " tools=no")
+        out(" %s %-42s ctx=%-6s %-18s%s" % (mark, m.id, m.context_label(), m.price_label(), tools_mark))
+    out(dim("* = current model   |   %d of %d shown   |   source: %s (%s)" %
+            (len(shown), len(models), source_label, age)))
+    out(dim("Tip: /models <search>, /models free, /models sort price|context|name, /models refresh"))
     out("")
+
+
+def switch_model(config, arg):
+    """Switch model with fuzzy matching against the live model list."""
+    from src.core.models import filter_models
+    out(dim("Checking model..."))
+    models, source = config.get_live_models()
+    exact = [m for m in models if m.id == arg]
+    if exact:
+        config.set("model", arg)
+        out(green("Model set to: %s" % arg))
+        return
+    matches = filter_models(models, arg)
+    if len(matches) == 1:
+        config.set("model", matches[0].id)
+        out(green("Model set to: %s (matched '%s')" % (matches[0].id, arg)))
+    elif len(matches) > 1:
+        out(yellow("'%s' matches %d models - be more specific:" % (arg, len(matches))))
+        for m in matches[:15]:
+            out("  %s" % m.id)
+    else:
+        config.set("model", arg)
+        out(yellow("'%s' not found in known models for this provider - set anyway." % arg))
 
 
 def show_tools():
@@ -203,13 +268,14 @@ def show_tools():
 
 
 def show_history(agent):
+    from src.core.agent import normalize_message_content
     msgs = agent.get_history()
     if not msgs:
         out(dim("No conversation history."))
         return
     for msg in msgs:
-        role = msg["role"]
-        content = msg["content"]
+        role = msg.get("role", "?")
+        content = normalize_message_content(msg)
         if len(content) > 300:
             content = content[:300] + "..."
         out("[%s] %s" % (role.upper(), content))
@@ -257,19 +323,19 @@ def config_wizard(config, PROVIDERS):
         config.set_api_key(provider, new_key)
         out(green("API key saved."))
 
-    all_models = config.all_models(provider)
-    if all_models:
+    out(dim("Fetching available models..."))
+    models, source = config.get_live_models(provider)
+    if models:
         out("")
-        out("Available models for %s:" % pname)
-        info = config.get_provider_info(provider)
-        free_models = info.get("free_models", [])
-        for i, m in enumerate(all_models):
-            mark = "*" if m == config.model else " "
-            free_label = " (FREE)" if m in free_models else ""
-            out("  [%2d] %s %s%s" % (i + 1, mark, m, free_label))
+        out("Available models for %s (source: %s):" % (pname, source))
+        for i, m in enumerate(models[:40]):
+            mark = "*" if m.id == config.model else " "
+            out("  [%2d] %s %s  (%s ctx, %s)" % (i + 1, mark, m.id, m.context_label(), m.price_label()))
+        if len(models) > 40:
+            out("  ... and %d more - use /models <search> to find them" % (len(models) - 40))
         choice = safe_input("Model number (Enter to keep current): ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(all_models):
-            new_model = all_models[int(choice) - 1]
+        if choice.isdigit() and 1 <= int(choice) <= min(40, len(models)):
+            new_model = models[int(choice) - 1].id
             config.set("model", new_model)
             out(green("Model set to: %s" % new_model))
 
@@ -386,20 +452,29 @@ class PlainApp(object):
         elif command == "/config":
             config_wizard(config, PROVIDERS)
         elif command == "/models":
-            show_models(config)
+            mq, msort, mfree, mrefresh = _parse_models_args(arg)
+            show_models(config, query=mq, sort_by=msort, free_only=mfree, refresh=mrefresh)
         elif command == "/model":
             if arg:
-                config.set("model", arg.strip())
-                out(green("Model set to: %s" % arg.strip()))
+                switch_model(config, arg.strip())
             else:
                 show_models(config)
         elif command == "/provider":
             if arg and arg.strip() in PROVIDERS:
-                config.set("provider", arg.strip())
-                models = config.all_models(arg.strip())
-                if models:
-                    config.set("model", models[0])
-                out(green("Provider set to: %s, model: %s" % (arg.strip(), config.model)))
+                new_provider = arg.strip()
+                config.set("provider", new_provider)
+                try:
+                    out(dim("Finding a default model..."))
+                    models, _src = config.get_live_models(new_provider)
+                    free = [m for m in models if m.is_free]
+                    pick = (free[0] if free else models[0]) if models else None
+                    if pick:
+                        config.set("model", pick.id)
+                except Exception:
+                    static = config.all_models(new_provider)
+                    if static:
+                        config.set("model", static[0])
+                out(green("Provider set to: %s, model: %s" % (new_provider, config.model)))
             else:
                 out(yellow("Available providers: %s" % ", ".join(PROVIDERS.keys())))
         elif command == "/workspace":

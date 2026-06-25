@@ -3,9 +3,11 @@
 #
 # These are OPTIONAL. AIdex runs with zero dependencies using its
 # built-in plain-text interface (src/tui/plain.py), which works on
-# Python 2.7+ including Windows XP and 32-bit systems.
+# Python 2.7+ including Windows XP and 32-bit systems. The web UI
+# (python aidex.py --web) is also zero-dependency — it uses only the
+# stdlib http.server module, no Flask/Django/etc. required.
 #
-# Installing the packages below enables the enhanced Rich UI
+# Installing the packages below enables the enhanced terminal UI
 # (syntax highlighting, live rendering, auto-complete). Requires
 # Python 3.7+.
 

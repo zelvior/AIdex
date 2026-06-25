@@ -69,7 +69,7 @@ BANNER = r"""
 /_/ |_|/___/\_,_/\__/_\_\
 """
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def show_banner():
@@ -87,8 +87,8 @@ def show_banner():
 COMMANDS = {
     "/help": "Show this help",
     "/config": "Configure API keys and settings",
-    "/models": "List available models",
-    "/model <name>": "Switch model",
+    "/models": "List live models (try: /models free, /models sort price, /models refresh)",
+    "/model <name>": "Switch model (fuzzy-matched against live list)",
     "/provider <name>": "Switch provider (openrouter/groq/anthropic/openai)",
     "/workspace <path>": "Change workspace directory",
     "/clear": "Clear conversation history",
@@ -243,36 +243,110 @@ def show_tools():
     console.print(table)
 
 
-def show_models():
+def show_models(query: str = "", sort_by: str = "name", free_only: bool = False, refresh: bool = False):
+    from src.core.models import filter_models, sort_models
+
     provider = config.provider
     info = config.get_provider_info()
-    free = info.get("free_models", [])
-    paid = info.get("paid_models", [])
+    pname = info.get("name", provider)
 
-    table = Table(title=f"Models - {info.get('name', provider)}", box=box.ROUNDED, border_style="cyan")
-    table.add_column("Model", style="cyan")
-    table.add_column("Type", style="bold")
-    for m in free:
-        mark = "★ " if m == config.model else "  "
-        table.add_row(mark + m, Text("FREE", style="green"))
-    for m in paid:
-        mark = "★ " if m == config.model else "  "
-        table.add_row(mark + m, Text("PAID", style="yellow"))
+    with console.status(f"[dim]Fetching live models for {pname}...[/dim]", spinner="dots"):
+        models, source = config.get_live_models(force_refresh=refresh)
+
+    shown = sort_models(filter_models(models, query, free_only), sort_by)
+
+    source_label = {
+        "live": "[green]● live[/green]",
+        "cache": "[cyan]● cached[/cyan]",
+        "stale-cache": "[yellow]● cached (stale, refetch failed)[/yellow]",
+        "static-fallback": "[red]● built-in fallback (no network/cache)[/red]",
+    }.get(source, source)
+    age = config.models_cache_age() if source != "live" else "just now"
+
+    title = f"Models — {pname}"
+    if query:
+        title += f"  (filter: '{query}')"
+    table = Table(title=title, box=box.ROUNDED, border_style="cyan")
+    table.add_column("", width=2)
+    table.add_column("Model", style="cyan", no_wrap=False)
+    table.add_column("Context", justify="right", style="dim")
+    table.add_column("Price (per 1M tok)", justify="right")
+    table.add_column("Tools", justify="center", style="dim")
+
+    for m in shown[:80]:
+        mark = "★" if m.id == config.model else " "
+        price_style = "green" if m.is_free else "yellow"
+        price_text = Text(m.price_label(), style=price_style)
+        tools_mark = "✓" if m.supports_tools else ("" if m.supports_tools is None else "✗")
+        table.add_row(mark, m.id, m.context_label(), price_text, tools_mark)
+
     console.print(table)
-    console.print(Text("★ = current model", style="dim"))
+    console.print(f"★ = current model   |   {len(shown)} of {len(models)} shown   |   source: {source_label} ({age})")
+    console.print("[dim]Tip: /models <search>, /models free, /models sort price|context|name, /models refresh[/dim]")
+
+
+def _parse_models_args(arg: str):
+    """Parse '/models <free|refresh|sort X|search terms>' (any combination,
+    space separated) into (query, sort_by, free_only, refresh)."""
+    tokens = arg.split()
+    query_parts = []
+    sort_by = "name"
+    free_only = False
+    refresh = False
+    i = 0
+    while i < len(tokens):
+        t = tokens[i].lower()
+        if t == "free":
+            free_only = True
+        elif t == "refresh":
+            refresh = True
+        elif t == "sort" and i + 1 < len(tokens):
+            sort_by = tokens[i + 1].lower()
+            i += 1
+        else:
+            query_parts.append(tokens[i])
+        i += 1
+    return " ".join(query_parts), sort_by, free_only, refresh
+
+
+def _switch_model(arg: str):
+    """Switch model with fuzzy matching against the live model list, since
+    typing an exact provider-prefixed slug is error-prone."""
+    from src.core.models import filter_models
+    with console.status("[dim]Checking model...[/dim]", spinner="dots"):
+        models, source = config.get_live_models()
+    exact = [m for m in models if m.id == arg]
+    if exact:
+        config.set("model", arg)
+        console.print(f"[success]Model set to: {arg}[/success]")
+        return
+    matches = filter_models(models, arg)
+    if len(matches) == 1:
+        config.set("model", matches[0].id)
+        console.print(f"[success]Model set to: {matches[0].id}[/success] [dim](matched '{arg}')[/dim]")
+    elif len(matches) > 1:
+        console.print(f"[warning]'{arg}' matches {len(matches)} models — be more specific:[/warning]")
+        for m in matches[:15]:
+            console.print(f"  {m.id}")
+    else:
+        # No match in live list — allow setting anyway (e.g. brand-new model
+        # not yet reflected in cache), but warn.
+        config.set("model", arg)
+        console.print(f"[warning]'{arg}' not found in known models for this provider — set anyway.[/warning]")
 
 
 def show_history():
+    from src.core.agent import normalize_message_content
     msgs = agent.get_history()
     if not msgs:
         console.print("[dim]No conversation history.[/dim]")
         return
     for i, msg in enumerate(msgs):
-        role = msg["role"]
-        content = msg["content"]
+        role = msg.get("role", "?")
+        content = normalize_message_content(msg)
         if len(content) > 300:
             content = content[:300] + "…"
-        style = "green" if role == "user" else "blue"
+        style = "green" if role == "user" else ("magenta" if role == "tool" else "blue")
         console.print(Panel(content, title=f"[{style}]{role.upper()}[/{style}]",
                             border_style=style, padding=(0, 1)))
 
@@ -318,20 +392,20 @@ def config_wizard():
         config.set_api_key(provider, new_key)
         console.print("[success]API key saved.[/success]")
 
-    # Model selection
-    all_models = config.all_models(provider)
-    if all_models:
-        console.print(f"\n[bold]Available models for {pname}:[/bold]")
-        info = config.get_provider_info(provider)
-        free_models = info.get("free_models", [])
-        for i, m in enumerate(all_models):
-            mark = "★" if m == config.model else " "
-            free_label = " [green](FREE)[/green]" if m in free_models else ""
-            console.print(f"  [{i+1:2d}] {mark} {m}{free_label}")
+    # Model selection — live, with pricing/context shown
+    with console.status("[dim]Fetching available models...[/dim]", spinner="dots"):
+        models, source = config.get_live_models(provider)
+    if models:
+        console.print(f"\n[bold]Available models for {pname}[/bold] [dim](source: {source})[/dim]:")
+        for i, m in enumerate(models[:40]):
+            mark = "★" if m.id == config.model else " "
+            console.print(f"  [{i+1:2d}] {mark} {m.id}  [dim]({m.context_label()} ctx, {m.price_label()})[/dim]")
+        if len(models) > 40:
+            console.print(f"  [dim]... and {len(models) - 40} more — use /models <search> to find them[/dim]")
 
-        choice = _prompt_input(f"Model number (Enter to keep current): ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(all_models):
-            new_model = all_models[int(choice) - 1]
+        choice = _prompt_input("Model number (Enter to keep current): ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= min(40, len(models)):
+            new_model = models[int(choice) - 1].id
             config.set("model", new_model)
             console.print(f"[success]Model set to: {new_model}[/success]")
 
@@ -460,7 +534,7 @@ def show_terms():
     terms = """
 # Terms and Conditions
 
-**AIdex AI Coding Agent** — Version 1.1.0  
+**AIdex AI Coding Agent** — Version 1.2.0  
 **License**: Apache 2.0  
 **Effective Date**: 2024
 
@@ -527,7 +601,7 @@ def show_privacy():
     privacy = """
 # Privacy Policy
 
-**AIdex AI Coding Agent** — Version 1.1.0
+**AIdex AI Coding Agent** — Version 1.2.0
 
 ## Summary
 AIdex is a **local application**. It does NOT collect your data, track you, or phone home.
@@ -670,23 +744,33 @@ class AIdexApp:
             config_wizard()
 
         elif command == "/models":
-            show_models()
+            mq, msort, mfree, mrefresh = _parse_models_args(arg)
+            show_models(query=mq, sort_by=msort, free_only=mfree, refresh=mrefresh)
 
         elif command == "/model":
             if arg:
-                config.set("model", arg.strip())
-                console.print(f"[success]Model set to: {arg.strip()}[/success]")
+                _switch_model(arg.strip())
             else:
                 show_models()
 
         elif command == "/provider":
             if arg and arg.strip() in PROVIDERS:
-                config.set("provider", arg.strip())
-                # Set a default model for that provider
-                models = config.all_models(arg.strip())
-                if models:
-                    config.set("model", models[0])
-                console.print(f"[success]Provider set to: {arg.strip()}, model: {config.model}[/success]")
+                new_provider = arg.strip()
+                config.set("provider", new_provider)
+                # Pick a sensible default model for the new provider: prefer
+                # a live free model, fall back to the static list, never crash.
+                try:
+                    with console.status("[dim]Finding a default model...[/dim]", spinner="dots"):
+                        models, _src = config.get_live_models(new_provider)
+                    free = [m for m in models if m.is_free]
+                    pick = (free[0] if free else models[0]) if models else None
+                    if pick:
+                        config.set("model", pick.id)
+                except Exception:
+                    static = config.all_models(new_provider)
+                    if static:
+                        config.set("model", static[0])
+                console.print(f"[success]Provider set to: {new_provider}, model: {config.model}[/success]")
             else:
                 console.print(f"[warning]Available providers: {', '.join(PROVIDERS.keys())}[/warning]")
 

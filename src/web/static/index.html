@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AIdex — AI Coding Agent</title>
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 rx=%2222%22 fill=%22%230d1117%22/><text x=%2250%22 y=%2268%22 font-size=%2258%22 text-anchor=%22middle%22 fill=%22%23f5a623%22 font-family=%22monospace%22>A</text></svg>">
+</head>
+<body>
+
+<div class="app" id="app">
+
+  <!-- ───────────────────────── Left rail ───────────────────────── -->
+  <nav class="rail" id="rail" aria-label="Workspace navigation">
+    <div class="rail-brand">
+      <span class="brand-mark">A</span>
+      <span class="brand-name">AIdex</span>
+    </div>
+
+    <div class="rail-section">
+      <button class="rail-btn is-active" data-panel="chat" type="button">
+        <svg viewBox="0 0 24 24" class="icon"><path d="M4 4h16v12H7l-3 3V4z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        <span>Chat</span>
+      </button>
+      <button class="rail-btn" data-panel="files" type="button">
+        <svg viewBox="0 0 24 24" class="icon"><path d="M4 6h6l2 2h8v11H4V6z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+        <span>Files</span>
+      </button>
+      <button class="rail-btn" data-panel="models" type="button">
+        <svg viewBox="0 0 24 24" class="icon"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7v5l3.2 3.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <span>Models</span>
+      </button>
+      <button class="rail-btn" data-panel="settings" type="button">
+        <svg viewBox="0 0 24 24" class="icon"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v2.4M12 18.6V21M21 12h-2.4M5.4 12H3M18 6l-1.6 1.6M7.6 16.4 6 18M18 18l-1.6-1.6M7.6 7.6 6 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+        <span>Settings</span>
+      </button>
+    </div>
+
+    <div class="rail-spacer"></div>
+
+    <div class="rail-status" id="railStatus" title="Connection status">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusLabel">connecting…</span>
+    </div>
+  </nav>
+
+  <!-- ───────────────────────── Chat panel ───────────────────────── -->
+  <main class="panel panel-chat is-active" id="panel-chat" aria-label="Chat">
+    <header class="panel-header">
+      <div class="header-left">
+        <span class="model-chip" id="modelChip">— / —</span>
+      </div>
+      <div class="header-right">
+        <button class="ghost-btn" id="clearBtn" type="button">Clear</button>
+      </div>
+    </header>
+
+    <div class="chat-scroll" id="chatScroll">
+      <div class="empty-state" id="emptyState">
+        <div class="empty-mark">A</div>
+        <h1>What are we building?</h1>
+        <p>AIdex can read &amp; write files, run commands, manage git, and check live model pricing — right from this chat.</p>
+        <div class="suggestion-row">
+          <button class="suggestion" data-prompt="Analyze this project's structure and summarize it.">Analyze this project</button>
+          <button class="suggestion" data-prompt="What free models are available right now?">Free models right now</button>
+          <button class="suggestion" data-prompt="List the files in the current directory.">List files here</button>
+        </div>
+      </div>
+      <div class="messages" id="messages"></div>
+    </div>
+
+    <form class="composer" id="composer">
+      <textarea
+        id="composerInput"
+        class="composer-input"
+        placeholder="Message AIdex… (Shift+Enter for a new line)"
+        rows="1"
+        autocomplete="off"
+        spellcheck="false"
+      ></textarea>
+      <button type="submit" class="send-btn" id="sendBtn" aria-label="Send message">
+        <svg viewBox="0 0 24 24" class="icon"><path d="M5 12h13M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </form>
+  </main>
+
+  <!-- ───────────────────────── Files panel ───────────────────────── -->
+  <section class="panel panel-files" id="panel-files" aria-label="File browser">
+    <header class="panel-header">
+      <div class="header-left">
+        <span class="panel-title">Files</span>
+        <span class="path-breadcrumb" id="fsBreadcrumb">.</span>
+      </div>
+      <div class="header-right">
+        <button class="ghost-btn" id="fsRefreshBtn" type="button">Refresh</button>
+      </div>
+    </header>
+    <div class="files-body">
+      <aside class="file-list" id="fileList"><div class="muted pad">Loading…</div></aside>
+      <div class="file-viewer">
+        <div class="file-viewer-header">
+          <span id="fileViewerName" class="muted">No file selected</span>
+          <button class="ghost-btn small" id="fileSaveBtn" type="button" hidden>Save</button>
+        </div>
+        <textarea id="fileViewerContent" class="file-editor" spellcheck="false" placeholder="Select a file to view or edit it…" disabled></textarea>
+      </div>
+    </div>
+  </section>
+
+  <!-- ───────────────────────── Models panel ───────────────────────── -->
+  <section class="panel panel-models" id="panel-models" aria-label="Model browser">
+    <header class="panel-header">
+      <div class="header-left">
+        <span class="panel-title">Models</span>
+        <span class="source-pill" id="modelsSourcePill">—</span>
+      </div>
+      <div class="header-right">
+        <button class="ghost-btn" id="modelsRefreshBtn" type="button">Refresh live</button>
+      </div>
+    </header>
+
+    <div class="models-toolbar">
+      <select id="providerSelect" class="select" aria-label="Provider"></select>
+      <input id="modelSearch" class="text-input" type="search" placeholder="Search models…" autocomplete="off">
+      <div class="seg" id="sortSeg" role="tablist" aria-label="Sort models">
+        <button class="seg-btn is-active" data-sort="name" type="button">Name</button>
+        <button class="seg-btn" data-sort="price" type="button">Price</button>
+        <button class="seg-btn" data-sort="context" type="button">Context</button>
+      </div>
+      <label class="checkbox">
+        <input type="checkbox" id="freeOnlyToggle">
+        <span>Free only</span>
+      </label>
+    </div>
+
+    <div class="models-table-wrap">
+      <table class="models-table">
+        <thead>
+          <tr><th></th><th>Model</th><th>Context</th><th>Price / 1M tok</th><th>Tools</th></tr>
+        </thead>
+        <tbody id="modelsTableBody">
+          <tr><td colspan="5" class="muted pad">Loading live models…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ───────────────────────── Settings panel ───────────────────────── -->
+  <section class="panel panel-settings" id="panel-settings" aria-label="Settings">
+    <header class="panel-header">
+      <div class="header-left"><span class="panel-title">Settings</span></div>
+    </header>
+    <div class="settings-body">
+
+      <section class="settings-group">
+        <h2>Provider &amp; API keys</h2>
+        <p class="muted">Keys are stored locally on this machine only, in your OS config directory. Never sent anywhere except the provider you choose.</p>
+        <div id="keyFields" class="key-fields"></div>
+      </section>
+
+      <section class="settings-group">
+        <h2>Workspace</h2>
+        <div class="field-row">
+          <input id="workspaceInput" class="text-input" type="text">
+          <button class="ghost-btn" id="workspaceSaveBtn" type="button">Save</button>
+        </div>
+      </section>
+
+      <section class="settings-group">
+        <h2>Behavior</h2>
+        <label class="switch-row">
+          <span>Safe mode <small class="muted">(blocks destructive shell commands)</small></span>
+          <input type="checkbox" id="safeModeToggle" class="switch">
+        </label>
+        <label class="switch-row">
+          <span>Stream responses</span>
+          <input type="checkbox" id="streamToggle" class="switch">
+        </label>
+        <div class="field-row">
+          <label class="field-label" for="maxTokensInput">Max tokens</label>
+          <input id="maxTokensInput" class="text-input small" type="number" min="1" max="200000">
+        </div>
+        <div class="field-row">
+          <label class="field-label" for="temperatureInput">Temperature</label>
+          <input id="temperatureInput" class="text-input small" type="number" min="0" max="2" step="0.1">
+        </div>
+      </section>
+
+      <section class="settings-group">
+        <h2>About</h2>
+        <p class="muted">AIdex AI Coding Agent — web interface. Same engine as the terminal app: live model pricing, native tool calling, and local-first config. Apache 2.0.</p>
+      </section>
+
+    </div>
+  </section>
+
+</div>
+
+<div class="toast-stack" id="toastStack" aria-live="polite"></div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

@@ -34,7 +34,11 @@ class ToolResult:
 # ─── FILE TOOLS ──────────────────────────────────────────────────────────────
 
 def read_file(path: str, workspace: str = ".") -> ToolResult:
-    """Read a file's contents."""
+    """Read a file's contents, formatted with line numbers for AI/terminal
+    display. Do NOT use this for round-tripping into an editable UI — the
+    line-number prefixes and header are display formatting, not file
+    content; saving that text back would corrupt the file. Use
+    read_file_raw() for that instead."""
     try:
         full = _resolve(path, workspace)
         if not os.path.exists(full):
@@ -46,6 +50,25 @@ def read_file(path: str, workspace: str = ".") -> ToolResult:
         lines = content.split("\n")
         numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
         return ToolResult(True, f"[File: {path}] ({len(lines)} lines)\n{numbered}")
+    except Exception as e:
+        return ToolResult(False, "", str(e))
+
+
+def read_file_raw(path: str, workspace: str = ".") -> ToolResult:
+    """Read a file's exact raw contents with no formatting, header, or
+    line numbers added — safe to load into an editable text box and save
+    straight back. Used by the web UI's file viewer/editor."""
+    try:
+        full = _resolve(path, workspace)
+        if not os.path.exists(full):
+            return ToolResult(False, "", f"File not found: {path}")
+        if not os.path.isfile(full):
+            return ToolResult(False, "", f"Not a file: {path}")
+        if os.path.getsize(full) > 5 * 1024 * 1024:  # 5MB limit
+            return ToolResult(False, "", f"File too large (>5MB): {path}")
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        return ToolResult(True, content)
     except Exception as e:
         return ToolResult(False, "", str(e))
 
@@ -203,6 +226,33 @@ def list_directory(path: str = ".", workspace: str = ".", show_hidden: bool = Fa
         return ToolResult(False, "", str(e))
 
 
+def list_directory_flat(path: str = ".", workspace: str = ".", show_hidden: bool = False):
+    """Single-level, structured directory listing for UI consumption (the
+    web file browser). Unlike list_directory(), this returns a plain list
+    of dicts rather than a pre-rendered text tree, so a frontend can render
+    and navigate it without parsing emoji-prefixed text lines."""
+    try:
+        full = _resolve(path, workspace)
+        if not os.path.isdir(full):
+            return ToolResult(False, "", f"Not a directory: {path}"), []
+        entries = sorted(os.scandir(full), key=lambda e: (not e.is_dir(), e.name.lower()))
+        items = []
+        for entry in entries:
+            if not show_hidden and entry.name.startswith("."):
+                continue
+            is_dir = entry.is_dir()
+            item = {"name": entry.name, "is_dir": is_dir}
+            if not is_dir:
+                try:
+                    item["size"] = entry.stat().st_size
+                except OSError:
+                    item["size"] = 0
+            items.append(item)
+        return ToolResult(True, f"{len(items)} entries"), items
+    except Exception as e:
+        return ToolResult(False, "", str(e)), []
+
+
 def search_files(pattern: str, path: str = ".", workspace: str = ".", content: bool = False) -> ToolResult:
     """Search for files by name pattern or content."""
     try:
@@ -289,14 +339,14 @@ def run_command(cmd: str, workspace: str = ".", timeout: int = 60, safe_mode: bo
         return ToolResult(False, "", str(e))
 
 
-def run_python(code: str, workspace: str = ".") -> ToolResult:
+def run_python(code: str, workspace: str = ".", safe_mode: bool = True) -> ToolResult:
     """Execute Python code snippet."""
     import tempfile
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
             f.write(code)
             tmp = f.name
-        result = run_command(f"{sys.executable} {tmp}", workspace=workspace, timeout=30)
+        result = run_command(f"{sys.executable} {tmp}", workspace=workspace, timeout=30, safe_mode=safe_mode)
         try:
             os.unlink(tmp)
         except Exception:
@@ -861,4 +911,87 @@ TOOL_DEFINITIONS = [
             "name": "str - executable name",
         },
     },
+    {
+        "name": "list_models",
+        "description": "List currently available AI models for a provider, fetched live from the provider's API with real pricing and context length (cached for offline use).",
+        "parameters": {
+            "provider": "str - provider name (default: current provider)",
+            "free_only": "bool - only show free models (default: false)",
+            "refresh": "bool - force a fresh fetch, bypassing cache (default: false)",
+        },
+    },
 ]
+
+
+# ─── NATIVE FUNCTION-CALLING SCHEMA ─────────────────────────────────────────
+# Converts the compact TOOL_DEFINITIONS format above into real OpenAI-style
+# JSON Schema, so providers that support native function/tool calling
+# (OpenRouter, Groq, OpenAI, Ollama via OpenAI-compat, and Anthropic via its
+# own tool format) get reliable, structured tool calls instead of relying on
+# the model to emit a specific text pattern that has to be regex-parsed.
+
+_TYPE_MAP = {"str": "string", "int": "integer", "float": "number",
+             "bool": "boolean", "list": "array", "dict": "object"}
+
+
+def _parse_param_spec(spec: str):
+    """'str - file path' -> ('string', 'file path', required=True).
+    A description containing 'default:' marks the param as optional."""
+    if " - " in spec:
+        type_part, desc = spec.split(" - ", 1)
+    else:
+        type_part, desc = spec, ""
+    json_type = _TYPE_MAP.get(type_part.strip().lower(), "string")
+    required = "default:" not in desc.lower()
+    return json_type, desc.strip(), required
+
+
+def build_openai_tools_schema():
+    """Return TOOL_DEFINITIONS converted to OpenAI/Groq/OpenRouter-style
+    function-calling tool schemas."""
+    schemas = []
+    for t in TOOL_DEFINITIONS:
+        properties = {}
+        required = []
+        for pname, pspec in t["parameters"].items():
+            json_type, desc, is_required = _parse_param_spec(pspec)
+            properties[pname] = {"type": json_type, "description": desc}
+            if is_required:
+                required.append(pname)
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        })
+    return schemas
+
+
+def build_anthropic_tools_schema():
+    """Return TOOL_DEFINITIONS converted to Anthropic's native tool format
+    (input_schema instead of nested function.parameters)."""
+    schemas = []
+    for t in TOOL_DEFINITIONS:
+        properties = {}
+        required = []
+        for pname, pspec in t["parameters"].items():
+            json_type, desc, is_required = _parse_param_spec(pspec)
+            properties[pname] = {"type": json_type, "description": desc}
+            if is_required:
+                required.append(pname)
+        schemas.append({
+            "name": t["name"],
+            "description": t["description"],
+            "input_schema": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        })
+    return schemas

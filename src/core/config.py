@@ -41,6 +41,7 @@ def _legacy_config_dir() -> Path:
 CONFIG_DIR = get_config_dir()
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.json"
+MODELS_CACHE_DIR = CONFIG_DIR / "models_cache"
 _LEGACY_CONFIG_FILE = _legacy_config_dir() / "config.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -63,6 +64,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "stream": True,
     "plain_ui": False,
     "low_end_mode": False,
+    "web_allow_shell_tools": False,
     "request_timeout": 60,
     "max_retries": 2,
 }
@@ -185,6 +187,11 @@ class Config:
     def get(self, key: str, default=None):
         return self._data.get(key, default)
 
+    def as_dict(self) -> Dict[str, Any]:
+        """Return a shallow copy of all config values (callers should mask
+        secrets themselves before exposing this externally, e.g. over HTTP)."""
+        return dict(self._data)
+
     def set(self, key: str, value: Any):
         self._data[key] = value
         self.save()
@@ -213,6 +220,31 @@ class Config:
     def all_models(self, provider: Optional[str] = None) -> list:
         info = self.get_provider_info(provider)
         return info.get("free_models", []) + info.get("paid_models", [])
+
+    def get_live_models(self, provider: Optional[str] = None, force_refresh: bool = False,
+                         timeout: Optional[int] = None):
+        """Return (models: List[ModelInfo], source: str) using the real
+        provider API, with disk caching for offline/low-end resilience.
+        Falls back to the static built-in list (as ModelInfo) on total failure."""
+        from src.core.models import get_models, ModelInfo
+        p = provider or self.provider
+        info = self.get_provider_info(p)
+        api_key = self.get_api_key(p)
+        try:
+            models, source = get_models(
+                p, api_key, info["base_url"], MODELS_CACHE_DIR,
+                timeout=timeout or int(self.get("request_timeout", 60)),
+                force_refresh=force_refresh,
+            )
+            return models, source
+        except Exception:
+            static = [ModelInfo(id=m, is_free=(m in info.get("free_models", [])))
+                      for m in self.all_models(p)]
+            return static, "static-fallback"
+
+    def models_cache_age(self, provider: Optional[str] = None) -> str:
+        from src.core.models import cache_age_label
+        return cache_age_label(MODELS_CACHE_DIR, provider or self.provider)
 
     @property
     def provider(self) -> str:

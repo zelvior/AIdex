@@ -18,6 +18,8 @@ class AIProvider:
     """Base provider class using only stdlib urllib for maximum compatibility
     (Windows XP/7/8/10/11, Linux, macOS, 32-bit and 64-bit)."""
 
+    supports_native_tools = False
+
     def __init__(self, api_key: str, base_url: str, model: str,
                  timeout: int = 60, max_retries: int = 2):
         self.api_key = api_key
@@ -57,12 +59,17 @@ class AIProvider:
                 raise ProviderError(str(e))
         raise ProviderError(f"Network error: {last_err}")
 
-    def _stream_post(self, endpoint: str, payload: Dict) -> Iterator[str]:
-        """Stream SSE response, yielding text deltas."""
+    def _stream_post(self, endpoint: str, payload: Dict) -> Iterator[Dict]:
+        """Stream SSE response. Yields dicts: {"type": "text", "text": str}
+        or {"type": "tool_calls", "tool_calls": [...]} once fully assembled
+        at the end of the stream (OpenAI-style deltas arrive as fragments
+        across many chunks and must be reassembled before they're usable)."""
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         payload["stream"] = True
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=self._headers(), method="POST")
+        # Accumulator for partial tool_calls across chunks, keyed by index.
+        tc_acc: Dict[int, Dict[str, Any]] = {}
         try:
             with urllib.request.urlopen(req, timeout=max(self.timeout, 120)) as resp:
                 for raw_line in resp:
@@ -74,18 +81,48 @@ class AIProvider:
                         break
                     try:
                         obj = json.loads(chunk)
-                        delta = (obj.get("choices", [{}])[0]
-                                   .get("delta", {})
-                                   .get("content", ""))
-                        if delta:
-                            yield delta
-                    except (json.JSONDecodeError, IndexError):
+                    except json.JSONDecodeError:
                         continue
+                    choice = (obj.get("choices") or [{}])[0]
+                    delta = choice.get("delta", {})
+                    content = delta.get("content")
+                    if content:
+                        yield {"type": "text", "text": content}
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = tc.get("index", 0)
+                        slot = tc_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            slot["arguments"] += fn["arguments"]
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             raise ProviderError(f"HTTP {e.code}: {body}")
         except urllib.error.URLError as e:
             raise ProviderError(f"Network error: {e.reason}")
+
+        if tc_acc:
+            calls = []
+            for idx in sorted(tc_acc.keys()):
+                slot = tc_acc[idx]
+                try:
+                    args = json.loads(slot["arguments"]) if slot["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                calls.append({"id": slot["id"], "name": slot["name"], "arguments": args})
+            yield {"type": "tool_calls", "tool_calls": calls}
+
+    def _post_get(self, endpoint: str) -> Dict:
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        req = urllib.request.Request(url, headers=self._headers(), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=min(self.timeout, 15)) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return {}
 
     def chat(self, messages: List[Dict], stream: bool = False, **kwargs) -> Any:
         raise NotImplementedError
@@ -94,8 +131,18 @@ class AIProvider:
         return []
 
     def test_connection(self) -> bool:
+        """Verify the API key/endpoint works. Tries the cheap models-list
+        endpoint first (no token cost); only falls back to an actual chat
+        completion if that's unavailable, since a real completion costs
+        money on paid providers."""
         try:
-            self.chat([{"role": "user", "content": "ping"}], stream=False)
+            models = self.list_models()
+            if models:
+                return True
+        except Exception:
+            pass
+        try:
+            self.chat([{"role": "user", "content": "ping"}], stream=False, max_tokens=1)
             return True
         except Exception:
             return False
@@ -107,6 +154,8 @@ class ProviderError(Exception):
 
 class OpenAICompatProvider(AIProvider):
     """Handles OpenRouter, Groq, OpenAI, Ollama (all OpenAI-compatible APIs)."""
+
+    supports_native_tools = True
 
     def __init__(self, api_key: str, base_url: str, model: str,
                  extra_headers: Optional[Dict] = None,
@@ -120,18 +169,31 @@ class OpenAICompatProvider(AIProvider):
         return h
 
     def chat(self, messages: List[Dict], stream: bool = False,
-             max_tokens: int = 4096, temperature: float = 0.7, **kwargs) -> Any:
+             max_tokens: int = 4096, temperature: float = 0.7,
+             tools: Optional[List[Dict]] = None, **kwargs) -> Any:
         payload = {
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
         if stream:
             return self._stream_post("chat/completions", payload)
         else:
             resp = self._post("chat/completions", payload)
-            return resp["choices"][0]["message"]["content"]
+            message = resp["choices"][0]["message"]
+            result = {"text": message.get("content") or "", "tool_calls": []}
+            for tc in (message.get("tool_calls") or []):
+                fn = tc.get("function", {})
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                result["tool_calls"].append({"id": tc.get("id", ""), "name": fn.get("name", ""), "arguments": args})
+            return result
 
     def list_models(self) -> List[str]:
         try:
@@ -140,18 +202,11 @@ class OpenAICompatProvider(AIProvider):
         except Exception:
             return []
 
-    def _post_get(self, endpoint: str) -> Dict:
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        req = urllib.request.Request(url, headers=self._headers(), method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=min(self.timeout, 15)) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            return {}
-
 
 class AnthropicProvider(AIProvider):
     """Native Anthropic Messages API."""
+
+    supports_native_tools = True
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -160,8 +215,16 @@ class AnthropicProvider(AIProvider):
             "anthropic-version": "2023-06-01",
         }
 
+    def list_models(self) -> List[str]:
+        try:
+            resp = self._post_get("models")
+            return [m["id"] for m in resp.get("data", [])]
+        except Exception:
+            return []
+
     def chat(self, messages: List[Dict], stream: bool = False,
-             max_tokens: int = 4096, temperature: float = 0.7, **kwargs) -> Any:
+             max_tokens: int = 4096, temperature: float = 0.7,
+             tools: Optional[List[Dict]] = None, **kwargs) -> Any:
         # Separate system message if present
         system = ""
         filtered = []
@@ -178,20 +241,36 @@ class AnthropicProvider(AIProvider):
         }
         if system:
             payload["system"] = system
+        if tools:
+            payload["tools"] = tools
 
         if stream:
             return self._stream_anthropic(payload)
         else:
             resp = self._post("messages", payload)
-            return resp["content"][0]["text"]
+            text = ""
+            calls = []
+            for block in resp.get("content", []):
+                if block.get("type") == "text":
+                    text += block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    calls.append({"id": block.get("id", ""), "name": block.get("name", ""),
+                                  "arguments": block.get("input", {})})
+            return {"text": text, "tool_calls": calls}
 
-    def _stream_anthropic(self, payload: Dict) -> Iterator[str]:
+    def _stream_anthropic(self, payload: Dict) -> Iterator[Dict]:
+        """Yields {"type": "text", "text": str} during the stream, then a
+        single {"type": "tool_calls", "tool_calls": [...]} at the end if any
+        tool_use blocks were produced."""
         payload["stream"] = True
         url = f"{self.base_url}/messages"
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=self._headers(), method="POST")
+        # Per-index accumulator for tool_use blocks (name set at block-start,
+        # input arrives as fragmented partial_json across many deltas).
+        blocks: Dict[int, Dict[str, Any]] = {}
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 120)) as resp:
                 for raw_line in resp:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line.startswith("data:"):
@@ -199,13 +278,37 @@ class AnthropicProvider(AIProvider):
                     chunk = line[5:].strip()
                     try:
                         obj = json.loads(chunk)
-                        if obj.get("type") == "content_block_delta":
-                            yield obj.get("delta", {}).get("text", "")
                     except json.JSONDecodeError:
                         continue
+                    etype = obj.get("type")
+                    if etype == "content_block_start":
+                        cb = obj.get("content_block", {})
+                        if cb.get("type") == "tool_use":
+                            blocks[obj["index"]] = {"id": cb.get("id", ""), "name": cb.get("name", ""), "json": ""}
+                    elif etype == "content_block_delta":
+                        delta = obj.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            yield {"type": "text", "text": delta.get("text", "")}
+                        elif delta.get("type") == "input_json_delta":
+                            idx = obj.get("index")
+                            if idx in blocks:
+                                blocks[idx]["json"] += delta.get("partial_json", "")
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             raise ProviderError(f"HTTP {e.code}: {body}")
+        except urllib.error.URLError as e:
+            raise ProviderError(f"Network error: {e.reason}")
+
+        if blocks:
+            calls = []
+            for idx in sorted(blocks.keys()):
+                b = blocks[idx]
+                try:
+                    args = json.loads(b["json"]) if b["json"] else {}
+                except json.JSONDecodeError:
+                    args = {}
+                calls.append({"id": b["id"], "name": b["name"], "arguments": args})
+            yield {"type": "tool_calls", "tool_calls": calls}
 
 
 def create_provider(provider_name: str, api_key: str, model: str,
