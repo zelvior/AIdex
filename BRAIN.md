@@ -7,7 +7,7 @@
 
 **Project**: AIdex AI Coding Agent (formerly "Nexus") — a CLI/TUI/Web AI
 coding agent, by **Zelvior**, Apache 2.0 licensed.
-**Current version**: 1.2.0
+**Current version**: 1.3.0
 **Language**: Python, stdlib-first, optional deps only for the enhanced UI.
 **Core philosophy**: maximum compatibility (Windows XP 32-bit → Windows 11,
 Linux, macOS) + zero hard dependencies + graceful degradation everywhere.
@@ -56,19 +56,35 @@ src/
     agent.py        THE agent. Singleton `agent = Agent()`. chat_stream() is
                      the main loop — native tool calling with multi-turn
                      tool-result loop, regex fallback for non-native models.
+                     Also: _path_within() helper and the per-session
+                     confine_to_workspace/excluded_tools gating (§7).
     config.py       Singleton `config = Config()`. All settings, API keys,
-                     provider registry (PROVIDERS dict), live-model wrapper.
-    models.py       Live model fetching (OpenRouter/Groq/Anthropic/Ollama),
-                     disk caching with TTL, fallback chain: live → cache →
-                     stale-cache → static built-in list. Never raises to
-                     the caller in practice (config.get_live_models wraps it).
+                     provider registry (PROVIDERS + IMAGE_PROVIDERS dicts),
+                     live-model wrapper, image-generation wrapper.
+    models.py       Live model fetching (OpenRouter/Groq/Anthropic/Ollama/
+                     Gemini/Pollinations/custom), disk caching with TTL,
+                     fallback chain: live → cache → stale-cache → static
+                     built-in list. Never raises to the caller in practice
+                     (config.get_live_models wraps it).
+    imagegen.py     Image generation — free Pollinations by default (no
+                     key), or a custom OpenAI-images-JSON-style endpoint.
+                     See §6.
+    ralph.py        Autonomous task-loop orchestrator ("Ralph TUI" pattern).
+                     RalphState (persisted JSON task list) + RalphRunner
+                     (select → prompt → execute → detect → repeat). UI-
+                     agnostic — drives via callbacks, not printing. Pure
+                     stdlib, Python 2.7-compatible (no f-strings) so it
+                     runs identically under the plain TUI on XP/32-bit. See
+                     the dedicated Ralph section below.
   providers/
     base.py         AIProvider (base, stdlib urllib only) →
-                     OpenAICompatProvider (OpenRouter/Groq/OpenAI/Ollama) and
+                     OpenAICompatProvider (OpenRouter/Groq/OpenAI/Ollama/
+                     Gemini/Pollinations/custom — all just OpenAI-compatible
+                     endpoints, no new provider class needed) and
                      AnthropicProvider (native Anthropic API). Native
                      function-calling support, streaming + non-streaming.
   tools/
-    file_tools.py   ALL 33 tools live here as plain functions, each
+    file_tools.py   ALL 34 tools live here as plain functions, each
                      returning ToolResult(success, output, error). Also
                      TOOL_DEFINITIONS (compact param-spec format used to
                      generate help text) and the schema builders
@@ -78,23 +94,31 @@ src/
   tui/
     app.py          Rich/prompt_toolkit UI. Class AIdexApp. Has its own
                      COMMANDS dict + big if/elif dispatch in _handle_command.
+                     Owns a RalphState instance (self.ralph_state).
     plain.py        Stdlib-only mirror of app.py's functionality. Keep
                      feature parity — when you add a command to app.py,
-                     add the equivalent here too.
+                     add the equivalent here too. Also owns a RalphState.
   web/
     server.py       Handler(BaseHTTPRequestHandler) + run_web_server().
                      REST + SSE bridge to the same agent/config singletons.
                      Workspace confinement + shell-tool gating live here
                      (see Security section below — this is the ONE place
-                     with a different trust boundary than the CLI).
+                     with a different trust boundary than the CLI). Module-
+                     level `_ralph_state`/`_ralph_runner`/`_ralph_lock`
+                     singletons (NOT per-Handler-instance — every HTTP
+                     request gets a fresh Handler object, so anything that
+                     must persist across requests, like an in-progress
+                     Ralph run, has to live at module scope).
     static/
-      index.html    Single-page app shell, semantic HTML5, 4 panels
-                     (chat/files/models/settings) shown/hidden via CSS.
+      index.html    Single-page app shell, semantic HTML5, 5 panels
+                     (chat/files/models/ralph/settings) shown/hidden via CSS.
       style.css     Modern CSS: @layer, color-mix(), CSS custom properties.
                      Dark theme, amber accent (--accent: #f5a623).
       app.js        Vanilla ES module. No build step, no framework. Hand-
                      rolled SSE-over-fetch parser (EventSource doesn't
-                     support POST, so this isn't a real EventSource).
+                     support POST, so this isn't a real EventSource). Same
+                     parser pattern reused for both /api/chat and
+                     /api/ralph/run.
 ```
 
 ---
@@ -223,24 +247,73 @@ Singleton `config`. Config dir: `~/.config/aidex/` (Linux/XDG),
 load if no `aidex` config exists yet — don't remove `_LEGACY_CONFIG_FILE`
 handling in `load()`.
 
+**Default provider is `pollinations`, not OpenRouter** — this is the
+zero-config story: a fresh install can chat AND generate images with no
+key, no signup, immediately. Don't "fix" this back to a key-requiring
+default without good reason; it's intentional.
+
 Key methods: `config.get(key, default)`, `config.set(key, value)` (saves to
-disk immediately), `config.get_api_key(provider=None)`, `config.as_dict()`
-(public, use this instead of touching `_data` directly from outside the
-class), `config.get_provider_info(provider=None)`, `config.all_models(provider)`
+disk immediately), `config.get_api_key(provider=None)` (returns the
+literal stored key, or the sentinel `"not-needed"` for key-optional
+providers — **don't truthy-check this directly**, see below),
+`config.needs_api_key(provider=None)` / `config.has_usable_key(provider=None)`
+(use THESE for any "is this provider ready to use?" check — `has_usable_key`
+is what every UI status display should call), `config.as_dict()` (public,
+use this instead of touching `_data` directly from outside the class),
+`config.get_provider_info(provider=None)`, `config.all_models(provider)`
 (static fallback list only), `config.get_live_models(...)` (the real one,
 see §5), `config.models_cache_age(provider=None)`.
 
-`DEFAULT_CONFIG` keys you'll actually touch: `provider`, `model`,
-`*_api_key` (one per provider), `ollama_base_url`, `workspace`, `safe_mode`,
-`stream`, `max_tokens`, `temperature`, `request_timeout`, `max_retries`,
-`web_allow_shell_tools` (web-UI-specific, see §7, default False).
+A real bug that shipped and got fixed: several places (`agent.py`'s
+`_get_provider`, both TUIs' status displays, the web server's
+`/api/status`) used to do `if config.get_api_key()` to mean "is a key
+configured" — broke as soon as a key-optional provider's sentinel value
+made that always truthy. Fixed by adding `needs_api_key`/`has_usable_key`
+and switching every call site. If you add a new "is provider ready"
+check anywhere, use `has_usable_key()`, never raw `get_api_key()` truthiness.
 
-`PROVIDERS` dict: `openrouter`, `groq`, `anthropic`, `openai`, `ollama`.
-Each has `name`, `base_url`, `key_field`, `free_models`/`paid_models`
-(static fallback lists — these go stale, that's expected, that's why §5
-exists). Ollama's `base_url` is overridden per-instance from
-`config.get("ollama_base_url")` since it's a local server the user might
-run on a different port.
+`DEFAULT_CONFIG` keys you'll actually touch: `provider`, `model`,
+`*_api_key` (one per chat provider, see PROVIDERS below), `ollama_base_url`,
+`custom_base_url`/`custom_chat_model`, `workspace`, `safe_mode`, `stream`,
+`max_tokens`, `temperature`, `request_timeout`, `max_retries`,
+`web_allow_shell_tools` (web-UI-specific, see §7, default False),
+`image_provider`/`image_model`/`image_api_key`/`image_base_url` (image
+generation, configured independently of chat — see below).
+
+`PROVIDERS` dict (chat): `openrouter`, `groq`, `anthropic`, `openai`,
+`ollama`, `pollinations`, `gemini`, `custom`. Each has `name`, `base_url`,
+`key_field`, `free_models`/`paid_models` (static fallback lists — these go
+stale, that's expected, that's why §5 exists), and optionally
+`requires_key: False` (currently `ollama` and `pollinations` — both work
+with zero configuration). `ollama`'s and `custom`'s `base_url` are
+overridden per-instance from `config.get("ollama_base_url")` /
+`config.get("custom_base_url")` in `get_provider_info()` since those are
+user-supplied endpoints. `gemini` and `pollinations` are plain
+OpenAI-compatible endpoints — no new provider class was needed in
+`base.py`, they just work via the existing `OpenAICompatProvider` +
+`create_provider()`'s generic `else` branch.
+
+### Image generation (`src/core/imagegen.py`)
+
+Configured **independently** from the chat provider — you can chat via
+OpenRouter and still generate images via the free Pollinations default
+without switching anything. `IMAGE_PROVIDERS` dict (separate registry
+from chat `PROVIDERS`): `pollinations` (free, no key, GET-prompt-in-URL
+shape — `image.pollinations.ai/prompt/{prompt}?model=&width=&height=&seed=`,
+response body IS the raw image bytes) and `custom` (any other image API;
+`generate_image()` in imagegen.py picks the OpenAI-images-JSON shape
+instead of the GET shape if the configured base URL ends in `/v1` or
+`/openai`).
+
+Entry point: `config.generate_image(prompt, width, height, seed)` →
+returns an `ImageResult` (`.data` raw bytes, `.content_type`,
+`.suggested_filename()`). The `generate_image` tool in file_tools.py wraps
+this and saves to a file — it's a normal tool, registered in
+`TOOL_DEFINITIONS` like everything else, so it's automatically available
+to native function-calling with zero extra schema code, and reachable via
+`/image <prompt>` in both TUIs and `POST /api/image` on the web (which
+returns the image as base64 JSON, with an optional `save_as` to also
+write it to a workspace-confined path).
 
 ---
 
@@ -253,14 +326,30 @@ endpoint is not the same thing, even on localhost. Two real
 already-fixed vulnerabilities inform the current design — do not regress
 them:
 
-1. **Workspace confinement** (`_is_within_workspace()` in server.py): every
-   filesystem-touching web endpoint (`/api/fs/list`, `/api/fs/read`,
-   `/api/fs/write`, and path-like params in `/api/tool`) checks the
-   resolved path stays inside `config.workspace`. Absolute paths and `../`
-   traversal outside the workspace get `403`. The underlying
-   `_resolve()` in file_tools.py does NOT enforce this on its own (it's
-   permissive by design for the CLI) — the web layer must check it itself,
-   every time, for every new file-touching endpoint you add.
+1. **Workspace confinement** — two layers:
+   - **Direct endpoints**: `_is_within_workspace()` in server.py. Every
+     filesystem-touching web endpoint (`/api/fs/list`, `/api/fs/read`,
+     `/api/fs/write`, `/api/image` via `save_as`, and path-like params in
+     `/api/tool`) checks the resolved path stays inside `config.workspace`.
+     Absolute paths and `../` traversal outside the workspace get `403`.
+   - **Chat/tool-execution path**: `Agent._execute_tool()` has a second,
+     independent check via `self._confine_to_workspace` (set when
+     `chat_stream(..., confine_to_workspace=True)` is called) using the
+     `_path_within()` helper in agent.py. This exists because the AI can
+     call ANY tool with ANY params during a chat turn — a per-endpoint
+     check alone doesn't help when the model itself decides to pass an
+     absolute `output_path` to `generate_image` (or any future
+     file-writing tool) mid-conversation. The web server's
+     `_api_chat_stream()` always passes `confine_to_workspace=True`;
+     `agent.run_tool()` (used by the CLI/TUI directly) does NOT set this,
+     preserving the CLI's intentionally permissive behavior.
+   - The underlying `_resolve()` in file_tools.py does NOT enforce either
+     of these on its own (permissive by design for the CLI) — confinement
+     is the web layer's job, at both the endpoint level AND the
+     tool-execution level. If you add a new file-writing tool, check
+     whether its path-like params are named `path`/`file`/`directory`/
+     `output_path` (those are what both checks look for) — if you use a
+     different param name, add it to both checks.
 2. **Shell-tool gating**: `run_command`/`run_python` are excluded from the
    tool schema offered to the model during web chat by default
    (`_SHELL_TOOLS` set in server.py, checked against
@@ -270,10 +359,13 @@ them:
    regex tool-call fallback can't sneak through. If you add a new
    dangerous tool, add it to `_SHELL_TOOLS` too.
 
-If you add a new web endpoint that touches the filesystem or executes
-anything: route it through these same two checks. Don't assume "it's just
-localhost" — that mistake already shipped once in this project, was caught
-in browser-based testing, and got fixed.
+If you add a new web endpoint OR a new file-writing tool: route it through
+the relevant check(s) above. Don't assume "it's just localhost" — two
+separate variants of this mistake already shipped in this project (one in
+a direct endpoint, one via a tool's parameter reachable only through
+chat), both caught in testing and fixed. The lesson: checking the direct
+endpoint is not enough if the same write path is also reachable by the AI
+deciding to call a tool with attacker-influenced parameters.
 
 **Separately real bug, also fixed**: the file editor used to load
 `read_file()`'s *display-formatted* output into the editable textarea,
@@ -281,6 +373,15 @@ then save that formatted text straight back to disk on Save, corrupting
 every file edited through the web UI. Fixed by adding `read_file_raw()`/
 `list_directory_flat()` (§4) specifically for UI use. If you add another
 UI surface that reads-then-writes a file, use the raw variants.
+
+**Ralph (autonomous loop) gets the same gating, deliberately on by
+default with no opt-out in the UI**: `_api_ralph_run_stream()` always
+constructs its `RalphRunner` with `confine_to_workspace=True` and the
+same `_SHELL_TOOLS` exclusion as `/api/chat`. An unattended multi-task
+loop calling tools with no human watching each individual step is, if
+anything, a stronger case for these protections than a single chat turn
+a person is actively reading — don't relax this for Ralph specifically
+just because it "feels like a power-user feature."
 
 ---
 
@@ -305,13 +406,44 @@ All endpoints relative to wherever `run_web_server()` binds (default
 | GET | `/api/fs/list?path=` | `list_directory_flat`, confined per §7 |
 | GET | `/api/fs/read?path=` | `read_file_raw`, confined per §7 |
 | POST | `/api/fs/write` | `{path, content}`, confined per §7 |
+| GET | `/api/image-providers` | available image backends, key-requirement flags |
+| POST | `/api/image` | `{prompt, width?, height?, seed?, save_as?}` — generates an image, returns base64 inline; `save_as` confined per §7 |
+| GET | `/api/ralph` | task list + counts + `running`/`paused` state |
+| POST | `/api/ralph/add` | `{title}` |
+| POST | `/api/ralph/clear` | 409 if a run is in progress |
+| POST | `/api/ralph/stop` | cooperative — current task finishes, then the loop exits |
+| POST | `/api/ralph/run` | **SSE**, `{max_iterations?}` → events: `task_start`, `text`, `tool_call`, `tool_result`, `error`, `task_done`, `finished`. 409 if already running (module-level `_ralph_runner` lock, see directory map) |
 | POST | `/api/chat` | **SSE**, `{message}` → events: `text`, `tool_call`, `tool_result`, `error`, `done` |
 
-Frontend (`app.js`) parses `/api/chat`'s SSE manually via
+Frontend (`app.js`) parses both SSE endpoints manually via
 `fetch().body.getReader()` + a `\n\n`-delimited buffer parser — NOT the
 browser's native `EventSource`, because `EventSource` can't do POST
 bodies. If you change the SSE event format on the server, update the
-parser in `app.js` (`sendChat()` function) to match.
+matching parser in `app.js` (`sendChat()` for chat, the `ralphRunBtn`
+click handler for Ralph).
+
+**Every POST handler MUST drain the request body, even if it doesn't use
+it.** This server runs HTTP/1.1 with persistent connections. If a handler
+sends its response without calling `self._read_json_body()` first, the
+unread bytes of that request's body sit in the socket's read buffer and
+get prepended onto the *next* request line the browser sends on the same
+reused connection — corrupting it into a `501 Unsupported method`. This
+is a real bug that shipped (`/api/ralph/clear`, `/api/ralph/stop`, and
+the inline `/api/history/clear` branch all skipped it) and was only
+caught by testing in an actual browser with real connection reuse — `curl`
+each request in isolation, or even `curl --next`, did not reproduce it;
+only a genuinely reused `http.client`/browser connection did. If you add
+a new POST handler, call `self._read_json_body()` as the very first
+thing, even if the result is unused — don't assume "this endpoint takes
+no input" means it's safe to skip.
+
+A related but distinct issue: any handler that streams an unbounded
+response (SSE) without `Content-Length` or chunked encoding must send
+`Connection: close` and set `self.close_connection = True` — claiming
+`keep-alive` on a response whose end the client can only detect by the
+connection closing is contradictory framing. Both `/api/chat` and
+`/api/ralph/run` do this correctly now; if you add a third SSE endpoint,
+copy that pattern, not a `_send_json`-style response's headers.
 
 ---
 
@@ -356,6 +488,20 @@ parser in `app.js` (`sendChat()` function) to match.
   currently no Settings-panel toggle for it in the UI — that's
   deliberate, so enabling shell exec from the browser requires editing
   the config file directly, not one accidental click.
+- Default chat provider is `pollinations`, not OpenRouter — this is the
+  zero-config story (§6). Don't "fix" this back to a key-requiring
+  default.
+- Image generation (`config.image_provider`) is configured completely
+  separately from chat (`config.provider`) — that's intentional, not an
+  oversight to "simplify." A person should be able to use a paid/precise
+  chat model while still using the free Pollinations image default, or
+  vice versa.
+- `RalphRunner` is UI-agnostic by design (callbacks only, never prints or
+  touches `console`/`sys.stdout` itself) specifically so the identical
+  orchestration logic drives the plain TUI, the Rich TUI, and the web SSE
+  endpoint without three different implementations to keep in sync. If
+  you need Ralph to behave differently in one UI, do it in that UI's
+  callback functions, not by adding UI-specific branches inside ralph.py.
 
 ---
 
@@ -373,6 +519,23 @@ parser in `app.js` (`sendChat()` function) to match.
 - "New tool" → add the function to `file_tools.py`, add to
   `TOOL_DEFINITIONS`, add a dispatch entry in `agent.py`'s
   `_execute_tool`. If it's filesystem/shell-related, decide if it needs
-  to go in `_SHELL_TOOLS` (server.py) for web gating.
+  to go in `_SHELL_TOOLS` (server.py) for web gating, and whether its
+  path-like params need names matching the confinement check's list
+  (`path`/`file`/`directory`/`output_path`) or whether you need to add a
+  new name to that list (§7).
+- "New web POST endpoint" → call `self._read_json_body()` first, always,
+  even if you don't use the result (§8 — this exact omission shipped
+  twice). If it streams an unbounded response, send `Connection: close` +
+  `self.close_connection = True`, don't claim keep-alive (§8).
+- "Image generation not working" → `imagegen.py`'s `generate_image()`
+  dispatch (Pollinations GET-shape vs. custom OpenAI-images-JSON-shape),
+  or `config.generate_image()`'s wiring of `image_provider`/`image_model`.
+- "Ralph task stuck / loop won't continue" → check the task file
+  (`<workspace>/ralph_tasks.json`) directly — `status` should be
+  `pending`/`in_progress`/`done`/`failed`/`skipped`; a crash mid-task
+  leaves it `in_progress` forever since nothing resets it back to
+  `pending` automatically (by design — a human should look at why it got
+  stuck rather than silently retrying).
 - "Something crashes on old Windows/XP/32-bit" → check it's reachable via
-  `plain.py`, not just `app.py`; check no f-strings/walrus snuck in.
+  `plain.py`, not just `app.py`; check no f-strings/walrus snuck in
+  (`ralph.py` must stay clean too — it's imported by `plain.py`).

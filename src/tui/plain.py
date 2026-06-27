@@ -22,7 +22,7 @@ try:
 except NameError:
     string_types = (str,)
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 BANNER = r"""
    ___    ____    __
@@ -122,6 +122,11 @@ COMMANDS = [
     ("/disk [path]", "Show disk usage and directory size"),
     ("/env", "Show Python/OS/architecture info"),
     ("/which <name>", "Locate an executable on PATH"),
+    ("/image <prompt>", "Generate an image (free by default, no API key needed)"),
+    ("/ralph", "Show the Ralph task loop status"),
+    ("/ralph add <title>", "Add a task to the Ralph loop"),
+    ("/ralph run [n]", "Run the Ralph loop autonomously (default cap: 35 iterations)"),
+    ("/ralph clear", "Clear all Ralph tasks"),
     ("/safemode", "Toggle safe mode"),
     ("/docs", "Show documentation"),
     ("/credits", "Show credits"),
@@ -152,7 +157,7 @@ def status_line(config):
     model = config.model
     ws = config.workspace
     safe = "ON" if config.get("safe_mode") else "OFF"
-    key_ok = "set" if config.get_api_key() else "MISSING"
+    key_ok = "set" if config.has_usable_key() else "MISSING"
     out(dim("-" * 60))
     out("Provider: %s   Model: %s" % (provider, model))
     out("Workspace: %s" % ws)
@@ -169,7 +174,7 @@ def show_status(config, agent):
     out("  Platform:     %s %s" % (platform.system(), platform.release()))
     out("  Provider:     %s" % config.provider)
     out("  Model:        %s" % config.model)
-    out("  API Key:      %s" % ("set" if config.get_api_key() else "NOT set"))
+    out("  API Key:      %s" % ("set" if config.has_usable_key() else "NOT set"))
     out("  Workspace:    %s" % config.workspace)
     out("  Safe Mode:    %s" % ("ON" if config.get("safe_mode") else "OFF"))
     out("  Messages:     %d" % len(agent.messages))
@@ -256,6 +261,90 @@ def switch_model(config, arg):
         out(yellow("'%s' not found in known models for this provider - set anyway." % arg))
 
 
+def _status_icon(status):
+    return {"pending": " ", "in_progress": ">", "done": "x",
+            "failed": "!", "skipped": "-"}.get(status, "?")
+
+
+def show_ralph_status(state):
+    out(cyan("Ralph Task Loop"))
+    if not state.tasks:
+        out(dim("No tasks yet. Add one with: /ralph add <title>"))
+        out("")
+        return
+    counts = state.counts()
+    out(dim("Tasks file: %s" % state.tasks_path))
+    out(dim("pending=%d  in_progress=%d  done=%d  failed=%d  skipped=%d  (iteration %d)" % (
+        counts["pending"], counts["in_progress"], counts["done"],
+        counts["failed"], counts["skipped"], state.iteration)))
+    out("")
+    for t in state.tasks:
+        icon = _status_icon(t.status)
+        color = {"done": green, "failed": red, "in_progress": yellow}.get(t.status, dim)
+        out(color("  [%s] #%s %s" % (icon, t.id, t.title)))
+        if t.notes:
+            out(dim("        %s" % t.notes[:100]))
+    out("")
+    out(dim("/ralph run [max_iterations] to work through pending tasks autonomously"))
+    out("")
+
+
+def run_ralph_loop(config, agent, state, max_iterations):
+    from src.core.ralph import RalphRunner
+
+    pending_count = sum(1 for t in state.tasks if t.status == "pending")
+    if pending_count == 0:
+        out(yellow("No pending tasks. Add one with: /ralph add <title>"))
+        return
+
+    out(cyan("Starting Ralph loop: %d pending task(s), cap %d iteration(s)" % (pending_count, max_iterations)))
+    out(dim("Each task runs as its own focused agent turn. Ctrl+C to stop after the current task."))
+    out("")
+
+    runner = RalphRunner(agent, state, max_iterations=max_iterations)
+
+    def on_start(task, index, total):
+        out(cyan("--- Task %d/%d: %s ---" % (index, total, task.title)))
+
+    def on_event(task, etype, content):
+        if etype == "text":
+            sys.stdout.write(content)
+            sys.stdout.flush()
+        elif etype == "tool_call":
+            out("")
+            out(yellow("  > %s(...)" % content))
+        elif etype == "tool_result":
+            pass
+        elif etype == "error":
+            out("")
+            out(red("  Error: %s" % content))
+
+    def on_done(task, outcome):
+        out("")
+        if outcome == "done":
+            out(green("--- Task #%s complete ---" % task.id))
+        else:
+            out(red("--- Task #%s failed ---" % task.id))
+        out("")
+
+    def on_finished(reason):
+        labels = {
+            "completed": "All tasks complete!",
+            "max_iterations": "Stopped: hit the iteration cap (%d). Run /ralph run again to continue." % max_iterations,
+            "stopped": "Stopped by request. Run /ralph run again to resume.",
+            "no_tasks": "No tasks to run.",
+        }
+        out(cyan(labels.get(reason, "Finished: %s" % reason)))
+
+    try:
+        runner.run(on_task_start=on_start, on_task_event=on_event,
+                   on_task_done=on_done, on_finished=on_finished)
+    except KeyboardInterrupt:
+        runner.request_stop()
+        out("")
+        out(yellow("Stopping after current task..."))
+
+
 def show_tools():
     from src.tools.file_tools import TOOL_DEFINITIONS
     out(cyan("Available Tools"))
@@ -298,7 +387,7 @@ def print_tool_result(name, result):
         out("    " + line)
 
 
-def config_wizard(config, PROVIDERS):
+def config_wizard(config, PROVIDERS, IMAGE_PROVIDERS=None):
     out(cyan("Configuration Wizard"))
     providers = list(PROVIDERS.keys())
     for i, p in enumerate(providers):
@@ -318,6 +407,17 @@ def config_wizard(config, PROVIDERS):
     out("%s API Key (current: %s)" % (pname, display_key))
     if provider == "ollama":
         out(dim("Ollama runs locally - no real key needed. Base URL set separately."))
+    elif provider == "pollinations":
+        out(dim("No key needed - free, no signup. A key only raises your rate limit."))
+    elif provider == "gemini":
+        out(dim("Get a free key at: https://aistudio.google.com/apikey"))
+    elif provider == "custom":
+        out(dim("Point this at any OpenAI-compatible /chat/completions API."))
+        current_url = config.get("custom_base_url", "")
+        new_url = safe_input("Base URL (current: %s): " % (current_url or "(not set)")).strip()
+        if new_url:
+            config.set("custom_base_url", new_url)
+            out(green("Base URL set to: %s" % new_url))
     new_key = safe_input("API Key (Enter to keep): ").strip()
     if new_key:
         config.set_api_key(provider, new_key)
@@ -338,6 +438,30 @@ def config_wizard(config, PROVIDERS):
             new_model = models[int(choice) - 1].id
             config.set("model", new_model)
             out(green("Model set to: %s" % new_model))
+
+    if IMAGE_PROVIDERS:
+        cur_img_provider = config.get("image_provider", "pollinations")
+        out("")
+        out("Image generation (current: %s)" % IMAGE_PROVIDERS.get(cur_img_provider, {}).get("name", "?"))
+        img_providers = list(IMAGE_PROVIDERS.keys())
+        for i, p in enumerate(img_providers):
+            mark = "*" if p == cur_img_provider else " "
+            out("  [%d] %s %s (%s)" % (i + 1, mark, IMAGE_PROVIDERS[p]["name"], p))
+        choice = safe_input("Image provider [1-%d] (Enter to keep current): " % len(img_providers)).strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(img_providers):
+            new_img_provider = img_providers[int(choice) - 1]
+            config.set("image_provider", new_img_provider)
+            out(green("Image provider set to: %s" % new_img_provider))
+            if new_img_provider == "custom":
+                current_url = config.get("image_base_url", "")
+                new_url = safe_input("Image API base URL (current: %s): " % (current_url or "(not set)")).strip()
+                if new_url:
+                    config.set("image_base_url", new_url)
+                new_img_key = safe_input("Image API key (Enter to skip): ").strip()
+                if new_img_key:
+                    config.set("image_api_key", new_img_key)
+        elif cur_img_provider == "pollinations":
+            out(dim("Free, no signup, no key needed."))
 
     out("")
     out("Workspace (current: %s)" % config.workspace)
@@ -424,11 +548,15 @@ class PlainApp(object):
     without fancy rendering."""
 
     def __init__(self):
-        from src.core.config import config, PROVIDERS
+        from src.core.config import config, PROVIDERS, IMAGE_PROVIDERS
         from src.core.agent import agent
+        from src.core.ralph import RalphState, default_tasks_path
         self.config = config
         self.PROVIDERS = PROVIDERS
+        self.IMAGE_PROVIDERS = IMAGE_PROVIDERS
         self.agent = agent
+        self.ralph_state = RalphState(default_tasks_path(config.workspace))
+        self.ralph_state.load()
         self.agent.set_callbacks(
             on_tool_call=lambda name, params: print_tool_call(name, params),
             on_tool_result=lambda name, result: print_tool_result(name, result),
@@ -443,6 +571,7 @@ class PlainApp(object):
         config = self.config
         agent = self.agent
         PROVIDERS = self.PROVIDERS
+        IMAGE_PROVIDERS = self.IMAGE_PROVIDERS
 
         if command in ("/exit", "/quit"):
             out(cyan("Goodbye!"))
@@ -450,7 +579,7 @@ class PlainApp(object):
         elif command == "/help":
             show_help()
         elif command == "/config":
-            config_wizard(config, PROVIDERS)
+            config_wizard(config, PROVIDERS, IMAGE_PROVIDERS)
         elif command == "/models":
             mq, msort, mfree, mrefresh = _parse_models_args(arg)
             show_models(config, query=mq, sort_by=msort, free_only=mfree, refresh=mrefresh)
@@ -549,6 +678,45 @@ class PlainApp(object):
                 print_tool_result("which", result)
             else:
                 out(yellow("Usage: /which <name>"))
+        elif command == "/image":
+            if arg:
+                from src.tools.file_tools import generate_image
+                out(dim("Generating image..."))
+                result = generate_image(arg.strip(), config.workspace)
+                print_tool_result("generate_image", result)
+            else:
+                out(yellow("Usage: /image <description of the image>"))
+        elif command == "/ralph":
+            sub_parts = arg.strip().split(None, 1)
+            sub = sub_parts[0].lower() if sub_parts else ""
+            sub_arg = sub_parts[1] if len(sub_parts) > 1 else ""
+
+            if not sub:
+                show_ralph_status(self.ralph_state)
+            elif sub == "add":
+                if not sub_arg:
+                    out(yellow("Usage: /ralph add <task title>"))
+                else:
+                    task = self.ralph_state.add_task(sub_arg)
+                    self.ralph_state.save()
+                    out(green("Added task #%s: %s" % (task.id, task.title)))
+            elif sub == "run":
+                from src.core.ralph import DEFAULT_MAX_ITERATIONS
+                cap = DEFAULT_MAX_ITERATIONS
+                if sub_arg.strip().isdigit():
+                    cap = int(sub_arg.strip())
+                run_ralph_loop(config, agent, self.ralph_state, cap)
+            elif sub == "clear":
+                confirm = safe_input("Clear all %d Ralph task(s)? [y/N]: " % len(self.ralph_state.tasks)).strip().lower()
+                if confirm == "y":
+                    self.ralph_state.tasks = []
+                    self.ralph_state.iteration = 0
+                    self.ralph_state.save()
+                    out(green("Ralph tasks cleared."))
+                else:
+                    out(dim("Cancelled."))
+            else:
+                out(yellow("Usage: /ralph [add <title> | run [max_iterations] | clear]"))
         elif command == "/safemode":
             new_val = not config.get("safe_mode", True)
             config.set("safe_mode", new_val)
@@ -590,12 +758,14 @@ class PlainApp(object):
 
     def run(self):
         config = self.config
-        if not config.get_api_key():
+        if not config.has_usable_key():
             show_banner()
             out(yellow("Welcome to AIdex!"))
             out("To get started, configure an AI provider with /config")
-            out("Free options: OpenRouter (openrouter.ai), Groq (console.groq.com)")
+            out("Free, zero-config (default): Pollinations - chat + images, no key needed")
+            out("Other free options: OpenRouter (openrouter.ai), Groq (console.groq.com), Gemini (aistudio.google.com)")
             out("Offline option: Ollama (ollama.com) - no API key, no internet needed")
+            out("Try it now: /image a sunset over mountains")
             out("")
         else:
             show_banner()

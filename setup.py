@@ -15,8 +15,8 @@ with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
 
 setup(
     name="aidex-agent",
-    version="1.2.0",
-    description="Professional CLI AI Coding Agent — OpenRouter, Groq, Anthropic, OpenAI, Ollama",
+    version="1.3.0",
+    description="Professional CLI AI Coding Agent — OpenRouter, Groq, Anthropic, OpenAI, Gemini, Ollama, Pollinations",
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Zelvior",

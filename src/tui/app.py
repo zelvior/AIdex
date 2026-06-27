@@ -29,6 +29,7 @@ from rich.align import Align
 from rich import box
 from rich.style import Style
 from rich.theme import Theme
+from rich.prompt import Prompt
 
 # prompt_toolkit for input
 from prompt_toolkit import PromptSession
@@ -38,7 +39,7 @@ from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.completion import WordCompleter
 
-from src.core.config import config, PROVIDERS
+from src.core.config import config, PROVIDERS, IMAGE_PROVIDERS
 from src.core.agent import agent
 
 # ─── THEME ───────────────────────────────────────────────────────────────────
@@ -69,7 +70,7 @@ BANNER = r"""
 /_/ |_|/___/\_,_/\__/_\_\
 """
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 def show_banner():
@@ -104,6 +105,11 @@ COMMANDS = {
     "/disk [path]": "Show disk usage and directory size",
     "/env": "Show Python/OS/architecture info",
     "/which <name>": "Locate an executable on PATH",
+    "/image <prompt>": "Generate an image (free by default, no API key needed)",
+    "/ralph": "Show the Ralph task loop status",
+    "/ralph add <title>": "Add a task to the Ralph loop",
+    "/ralph run [n]": "Run the Ralph loop autonomously (default cap: 35 iterations)",
+    "/ralph clear": "Clear all Ralph tasks",
     "/safemode": "Toggle safe mode (blocks dangerous commands)",
     "/docs": "Show documentation",
     "/credits": "Show credits",
@@ -123,7 +129,7 @@ def status_bar():
     model = config.model
     ws = config.workspace
     safe = "🔒" if config.get("safe_mode") else "⚠️"
-    key_ok = "🔑" if config.get_api_key() else "❌"
+    key_ok = "🔑" if config.has_usable_key() else "❌"
     ws_short = ws if len(ws) < 40 else "…" + ws[-37:]
 
     table = Table(box=None, padding=(0, 1), show_header=False, expand=True)
@@ -208,7 +214,10 @@ def show_help():
     table.add_column("Command", style="bold magenta", width=25)
     table.add_column("Description")
     for cmd, desc in COMMANDS.items():
-        table.add_row(cmd, desc)
+        # Table cells are still parsed as Rich markup, so a literal "[path]"
+        # in a command name would otherwise be silently swallowed as an
+        # (unrecognized) style tag. Escape it so brackets render literally.
+        table.add_row(Text(cmd), Text(desc))
     console.print(table)
 
 
@@ -221,7 +230,7 @@ def show_status():
     table.add_row("Platform", f"{platform.system()} {platform.machine()}")
     table.add_row("Provider", config.provider)
     table.add_row("Model", config.model)
-    table.add_row("API Key", "✓ Set" if config.get_api_key() else "✗ Not set")
+    table.add_row("API Key", "✓ Set" if config.has_usable_key() else "✗ Not set")
     table.add_row("Workspace", config.workspace)
     table.add_row("Safe Mode", "✓ On" if config.get("safe_mode") else "✗ Off")
     table.add_row("Streaming", "✓ On" if config.get("stream") else "✗ Off")
@@ -335,6 +344,102 @@ def _switch_model(arg: str):
         console.print(f"[warning]'{arg}' not found in known models for this provider — set anyway.[/warning]")
 
 
+_RALPH_STATUS_STYLE = {
+    "pending": ("○", "dim"),
+    "in_progress": ("◐", "yellow"),
+    "done": ("✓", "green"),
+    "failed": ("✗", "red"),
+    "skipped": ("–", "dim"),
+}
+
+
+def show_ralph_status(state):
+    console.print(Panel("⚙ Ralph Task Loop", border_style="cyan", padding=(0, 1)))
+    if not state.tasks:
+        console.print("[dim]No tasks yet. Add one with: /ralph add <title>[/dim]\n")
+        return
+
+    counts = state.counts()
+    console.print(
+        f"[dim]{state.tasks_path}[/dim]\n"
+        f"pending=[white]{counts['pending']}[/white]  "
+        f"in_progress=[yellow]{counts['in_progress']}[/yellow]  "
+        f"done=[green]{counts['done']}[/green]  "
+        f"failed=[red]{counts['failed']}[/red]  "
+        f"skipped=[dim]{counts['skipped']}[/dim]   "
+        f"[dim](iteration {state.iteration})[/dim]"
+    )
+
+    table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
+    table.add_column("", width=2)
+    table.add_column("Task")
+    for t in state.tasks:
+        icon, style = _RALPH_STATUS_STYLE.get(t.status, ("?", "white"))
+        title = Text(f"#{t.id} {t.title}", style=style)
+        table.add_row(Text(icon, style=style), title)
+        if t.notes:
+            table.add_row("", Text(t.notes[:100], style="dim"))
+    console.print(table)
+    console.print(r"[dim]/ralph run \[max_iterations] to work through pending tasks autonomously[/dim]" + "\n")
+
+
+def run_ralph_loop(state, max_iterations):
+    from src.core.ralph import RalphRunner
+
+    pending_count = sum(1 for t in state.tasks if t.status == "pending")
+    if pending_count == 0:
+        console.print("[warning]No pending tasks. Add one with: /ralph add <title>[/warning]")
+        return
+
+    console.print(Panel(
+        f"Starting Ralph loop: [bold]{pending_count}[/bold] pending task(s), cap [bold]{max_iterations}[/bold] iteration(s)\n"
+        "[dim]Each task runs as its own focused agent turn. Ctrl+C to stop after the current task.[/dim]",
+        border_style="cyan", padding=(0, 1),
+    ))
+
+    runner = RalphRunner(agent, state, max_iterations=max_iterations)
+    current_tool_card = {"name": None}
+
+    def on_start(task, index, total):
+        console.print(Rule(f"[bold cyan]Task {index}/{total}: {task.title}[/bold cyan]", style="dim cyan"))
+
+    def on_event(task, etype, content):
+        if etype == "text":
+            console.print(content, end="")
+        elif etype == "tool_call":
+            console.print()
+            print_tool_call(content, {})
+        elif etype == "tool_result":
+            pass
+        elif etype == "error":
+            console.print()
+            console.print(f"[error]Error: {content}[/error]")
+
+    def on_done(task, outcome):
+        console.print()
+        if outcome == "done":
+            console.print(f"[success]--- Task #{task.id} complete ---[/success]\n")
+        else:
+            console.print(f"[error]--- Task #{task.id} failed ---[/error]\n")
+
+    def on_finished(reason):
+        labels = {
+            "completed": "[bold green]All tasks complete![/bold green]",
+            "max_iterations": f"[warning]Stopped: hit the iteration cap ({max_iterations}). "
+                               f"Run /ralph run again to continue.[/warning]",
+            "stopped": "[warning]Stopped by request. Run /ralph run again to resume.[/warning]",
+            "no_tasks": "[dim]No tasks to run.[/dim]",
+        }
+        console.print(labels.get(reason, f"Finished: {reason}"))
+
+    try:
+        runner.run(on_task_start=on_start, on_task_event=on_event,
+                   on_task_done=on_done, on_finished=on_finished)
+    except KeyboardInterrupt:
+        runner.request_stop()
+        console.print("\n[warning]Stopping after current task...[/warning]")
+
+
 def show_history():
     from src.core.agent import normalize_message_content
     msgs = agent.get_history()
@@ -363,7 +468,7 @@ def config_wizard():
         name = PROVIDERS[p]["name"]
         console.print(f"  [{i+1}] {mark} {name} ({p})")
 
-    choice = _prompt_input("Provider [1-4] (Enter to keep current): ").strip()
+    choice = _prompt_input(f"Provider [1-{len(providers)}] (Enter to keep current): ").strip()
     if choice.isdigit() and 1 <= int(choice) <= len(providers):
         new_provider = providers[int(choice) - 1]
         config.set("provider", new_provider)
@@ -386,6 +491,17 @@ def config_wizard():
         console.print("[dim]Get key at: https://platform.openai.com/[/dim]")
     elif provider == "ollama":
         console.print("[dim]No real key needed — install Ollama from ollama.com and run it locally.[/dim]")
+    elif provider == "pollinations":
+        console.print("[dim]No key needed — free, no signup. A key only raises your rate limit.[/dim]")
+    elif provider == "gemini":
+        console.print("[dim]Get a free key at: https://aistudio.google.com/apikey[/dim]")
+    elif provider == "custom":
+        console.print("[dim]Point this at any OpenAI-compatible /chat/completions API.[/dim]")
+        current_url = config.get("custom_base_url", "")
+        new_url = _prompt_input(f"Base URL (current: {current_url or '(not set)'}): ").strip()
+        if new_url:
+            config.set("custom_base_url", new_url)
+            console.print(f"[success]Base URL set to: {new_url}[/success]")
 
     new_key = _prompt_input("API Key (Enter to keep): ").strip()
     if new_key:
@@ -408,6 +524,28 @@ def config_wizard():
             new_model = models[int(choice) - 1].id
             config.set("model", new_model)
             console.print(f"[success]Model set to: {new_model}[/success]")
+
+    # Image generation — separate from chat, defaults to free Pollinations
+    console.print(f"\n[bold]Image generation[/bold] (current: {IMAGE_PROVIDERS.get(config.get('image_provider', 'pollinations'), {}).get('name', '?')})")
+    img_providers = list(IMAGE_PROVIDERS.keys())
+    for i, p in enumerate(img_providers):
+        mark = "★" if p == config.get("image_provider", "pollinations") else " "
+        console.print(f"  [{i+1}] {mark} {IMAGE_PROVIDERS[p]['name']} ({p})")
+    choice = _prompt_input(f"Image provider [1-{len(img_providers)}] (Enter to keep current): ").strip()
+    if choice.isdigit() and 1 <= int(choice) <= len(img_providers):
+        new_img_provider = img_providers[int(choice) - 1]
+        config.set("image_provider", new_img_provider)
+        console.print(f"[success]Image provider set to: {new_img_provider}[/success]")
+        if new_img_provider == "custom":
+            current_url = config.get("image_base_url", "")
+            new_url = _prompt_input(f"Image API base URL (current: {current_url or '(not set)'}): ").strip()
+            if new_url:
+                config.set("image_base_url", new_url)
+            new_img_key = _prompt_input("Image API key (Enter to skip): ").strip()
+            if new_img_key:
+                config.set("image_api_key", new_img_key)
+    elif config.get("image_provider", "pollinations") == "pollinations":
+        console.print("[dim]Free, no signup, no key needed.[/dim]")
 
     # Workspace
     console.print(f"\n[bold]Workspace[/bold] (current: {config.workspace})")
@@ -534,7 +672,7 @@ def show_terms():
     terms = """
 # Terms and Conditions
 
-**AIdex AI Coding Agent** — Version 1.2.0  
+**AIdex AI Coding Agent** — Version 1.3.0  
 **License**: Apache 2.0  
 **Effective Date**: 2024
 
@@ -601,7 +739,7 @@ def show_privacy():
     privacy = """
 # Privacy Policy
 
-**AIdex AI Coding Agent** — Version 1.2.0
+**AIdex AI Coding Agent** — Version 1.3.0
 
 ## Summary
 AIdex is a **local application**. It does NOT collect your data, track you, or phone home.
@@ -680,8 +818,11 @@ limitations under the License.
 
 class AIdexApp:
     def __init__(self):
+        from src.core.ralph import RalphState, default_tasks_path
         self._setup_callbacks()
         self._session = self._create_session()
+        self.ralph_state = RalphState(default_tasks_path(config.workspace))
+        self.ralph_state.load()
 
     def _setup_callbacks(self):
         agent.set_callbacks(
@@ -862,6 +1003,47 @@ class AIdexApp:
             else:
                 console.print("[warning]Usage: /which <name>[/warning]")
 
+        elif command == "/image":
+            if arg:
+                from src.tools.file_tools import generate_image
+                with console.status("[dim]Generating image...[/dim]", spinner="dots"):
+                    result = generate_image(arg.strip(), config.workspace)
+                print_tool_result("generate_image", result)
+            else:
+                console.print("[warning]Usage: /image <description of the image>[/warning]")
+
+        elif command == "/ralph":
+            sub_parts = arg.strip().split(None, 1)
+            sub = sub_parts[0].lower() if sub_parts else ""
+            sub_arg = sub_parts[1] if len(sub_parts) > 1 else ""
+
+            if not sub:
+                show_ralph_status(self.ralph_state)
+            elif sub == "add":
+                if not sub_arg:
+                    console.print("[warning]Usage: /ralph add <task title>[/warning]")
+                else:
+                    task = self.ralph_state.add_task(sub_arg)
+                    self.ralph_state.save()
+                    console.print(f"[success]Added task #{task.id}: {task.title}[/success]")
+            elif sub == "run":
+                from src.core.ralph import DEFAULT_MAX_ITERATIONS
+                cap = DEFAULT_MAX_ITERATIONS
+                if sub_arg.strip().isdigit():
+                    cap = int(sub_arg.strip())
+                run_ralph_loop(self.ralph_state, cap)
+            elif sub == "clear":
+                confirm = Prompt.ask(f"Clear all {len(self.ralph_state.tasks)} Ralph task(s)?", choices=["y", "n"], default="n")
+                if confirm == "y":
+                    self.ralph_state.tasks = []
+                    self.ralph_state.iteration = 0
+                    self.ralph_state.save()
+                    console.print("[success]Ralph tasks cleared.[/success]")
+                else:
+                    console.print("[dim]Cancelled.[/dim]")
+            else:
+                console.print("[warning]Usage: /ralph [add <title> | run [max_iterations] | clear][/warning]")
+
         elif command == "/safemode":
             new_val = not config.get("safe_mode", True)
             config.set("safe_mode", new_val)
@@ -935,18 +1117,24 @@ class AIdexApp:
 
     def run(self):
         """Main application loop."""
-        # Check for first-run setup
-        if not config.get_api_key():
+        # Check for first-run setup. With the default provider (Pollinations)
+        # this is now always usable with no config — has_usable_key() only
+        # comes back False for a provider that genuinely requires a key the
+        # user hasn't set yet.
+        if not config.has_usable_key():
             show_banner()
             console.print(Panel(
                 "[bold yellow]Welcome to AIdex! 🎉[/bold yellow]\n\n"
                 "To get started, you need to configure your AI provider API key.\n\n"
-                "[bold]Free options:[/bold]\n"
+                "[bold]Free, zero-config options (already the default):[/bold]\n"
+                "• [cyan]Pollinations[/cyan]: chat AND image generation, no signup, no key\n\n"
+                "[bold]Other free options:[/bold]\n"
                 "• [cyan]OpenRouter[/cyan]: openrouter.ai (many free models)\n"
-                "• [cyan]Groq[/cyan]: console.groq.com (fast, free)\n\n"
+                "• [cyan]Groq[/cyan]: console.groq.com (fast, free)\n"
+                "• [cyan]Gemini[/cyan]: aistudio.google.com/apikey (free tier)\n\n"
                 "[bold]Offline / low-end option:[/bold]\n"
                 "• [cyan]Ollama[/cyan]: ollama.com — runs fully local, no API key, no internet\n\n"
-                "Run [bold magenta]/config[/bold magenta] to set up your API key.",
+                "Run [bold magenta]/config[/bold magenta] to change providers, or [bold magenta]/image <prompt>[/bold magenta] to try image generation right now.",
                 title="First Run Setup",
                 border_style="cyan",
             ))

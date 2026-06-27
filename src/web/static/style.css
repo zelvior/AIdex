@@ -444,6 +444,58 @@
   .tools-check { color: var(--success); }
   .tools-cross { color: var(--text-tertiary); }
 
+  /* ---------- Ralph panel ---------- */
+  .ralph-toolbar {
+    display: flex; gap: 10px; align-items: center;
+    padding: 14px 20px; border-bottom: 1px solid var(--border-subtle);
+    flex-wrap: wrap;
+  }
+  .ralph-toolbar #ralphTaskInput { flex: 1; min-width: 200px; }
+  .ralph-toolbar-spacer { flex: 0 0 8px; }
+  .ralph-run-btn { width: 38px; height: 38px; }
+
+  .ralph-body { flex: 1; display: flex; min-height: 0; }
+  .ralph-tasks {
+    width: 320px; flex: 0 0 auto;
+    border-right: 1px solid var(--border-subtle);
+    overflow-y: auto;
+  }
+  .ralph-task-row {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 13px;
+  }
+  .ralph-task-icon {
+    flex: 0 0 auto; width: 16px; height: 16px;
+    border-radius: 50%;
+    display: grid; place-items: center;
+    font-size: 10px; font-weight: 700;
+    margin-top: 2px;
+  }
+  .ralph-task-row.is-pending .ralph-task-icon { background: var(--bg-raised); color: var(--text-tertiary); border: 1px solid var(--border-strong); }
+  .ralph-task-row.is-in_progress .ralph-task-icon { background: var(--accent-soft); color: var(--accent-strong); }
+  .ralph-task-row.is-done .ralph-task-icon { background: var(--success-soft); color: var(--success); }
+  .ralph-task-row.is-failed .ralph-task-icon { background: var(--danger-soft); color: var(--danger); }
+  .ralph-task-row.is-skipped .ralph-task-icon { background: var(--bg-raised); color: var(--text-tertiary); }
+  .ralph-task-title { flex: 1; min-width: 0; }
+  .ralph-task-notes { color: var(--text-tertiary); font-size: 11.5px; margin-top: 2px; }
+  .ralph-task-row.is-in_progress { background: var(--accent-soft); }
+
+  .ralph-log {
+    flex: 1; overflow-y: auto; padding: 16px 20px;
+    font-family: var(--font-mono); font-size: 13px; line-height: 1.6;
+  }
+  .ralph-log-entry { margin-bottom: 6px; white-space: pre-wrap; word-wrap: break-word; }
+  .ralph-log-rule {
+    display: flex; align-items: center; gap: 10px;
+    margin: 14px 0 8px; color: var(--accent-strong); font-weight: 600;
+  }
+  .ralph-log-rule::after { content: ""; flex: 1; height: 1px; background: var(--border-subtle); }
+  .ralph-log-tool { color: var(--accent-strong); }
+  .ralph-log-error { color: var(--danger); }
+  .ralph-log-status { color: var(--text-tertiary); font-style: italic; margin: 10px 0; }
+
   /* ---------- Settings panel ---------- */
   .settings-body { flex: 1; overflow-y: auto; padding: 24px; max-width: 640px; }
   .settings-group { margin-bottom: 32px; }

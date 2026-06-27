@@ -6,7 +6,7 @@
  / __ | _/ // _  / -_) \ /
 /_/ |_|/___/\_,_/\__/_\_\
 
-   Professional CLI AI Coding Agent v1.2.0
+   Professional CLI AI Coding Agent v1.3.0
 ```
 
 > Formerly known as **Nexus**. Renamed to **AIdex**. Old `nexus.py` /
@@ -29,8 +29,11 @@ AIdex is built to run **everywhere** — from a fresh Windows 11 64-bit machine 
 
 ## ✨ Features
 
-- 🤖 **Multi-Provider**: OpenRouter (100+ models), Groq (ultra-fast, free), Anthropic, OpenAI, **Ollama (fully local/offline, no API key)**
-- 🆓 **Free Models**: Many free models via OpenRouter and Groq — no credit card needed
+- 🆓 **Zero-Config by Default**: chat AND generate images out of the box, no API key, no signup — powered by [Pollinations](https://pollinations.ai)
+- 🤖 **Multi-Provider**: OpenRouter (100+ models), Groq (ultra-fast, free), Anthropic, OpenAI, Gemini, **Ollama (fully local/offline, no API key)**, **Pollinations (free, no API key)**, or any **custom** OpenAI-compatible endpoint
+- 🎨 **Free Image Generation**: `/image <prompt>` generates real images with no setup; bring your own image API if you want something else
+- 🌀 **Ralph TUI**: an autonomous task-loop — add tasks, hit run, and the agent works through them one at a time until done, with crash-safe resumable state
+- 🆓 **Free Models**: Many free models via OpenRouter, Groq, and Pollinations — no credit card needed
 - 📁 **File Operations**: Read, write, edit, delete, move, copy files
 - 🖊️ **Smart Editing**: `str_replace`-style edits with diff preview
 - 🖥️ **Shell Commands**: Execute any shell command in your workspace
@@ -47,8 +50,8 @@ AIdex is built to run **everywhere** — from a fresh Windows 11 64-bit machine 
 - 🐢 **Low-End Friendly**: Memory-bounded file tools (`tail_file`, `head_file`, `read_file_lines`) for huge files on limited RAM
 - 🔌 **Offline Mode**: Use Ollama for a fully local AI with no internet connection
 - 🔁 **Auto-Retry**: Network requests retry with backoff on transient failures
-- 🌐 **Web UI**: Full browser interface — chat, file browser/editor, live model pricing — served locally with zero extra dependencies
-- 🛠️ **Native Tool Calling**: Real function-calling for OpenRouter/Groq/OpenAI/Ollama/Anthropic, with multi-turn tool-result loops, not text-pattern guessing
+- 🌐 **Web UI**: Full browser interface — chat, file browser/editor, live model pricing, Ralph task loop — served locally with zero extra dependencies
+- 🛠️ **Native Tool Calling**: Real function-calling for OpenRouter/Groq/OpenAI/Ollama/Pollinations/Gemini/Anthropic, with multi-turn tool-result loops, not text-pattern guessing
 - 📡 **Live Model Pricing**: Real-time model lists with actual pricing and context length, cached for offline use
 
 ---
@@ -123,20 +126,24 @@ browser unless you explicitly opt in via `web_allow_shell_tools` in config.
 
 ## 🔑 API Keys (Free Options!)
 
-You do **not** need a paid API key to use AIdex. OpenRouter, Groq, and Ollama all offer free options:
+You do **not** need any API key to use AIdex — it works out of the box.
+OpenRouter, Groq, Ollama, and Pollinations all offer free options:
 
 | Provider | Free Models | Speed | Get Key |
 |----------|-------------|-------|---------|
+| **Pollinations** | ✅ Yes (chat + images) | Normal | No key needed — works immediately, default provider |
 | **OpenRouter** | ✅ Many free | Normal | [openrouter.ai](https://openrouter.ai) |
 | **Groq** | ✅ Yes (all!) | ⚡ Very fast | [console.groq.com](https://console.groq.com) |
 | **Ollama** | ✅ Yes (all, local) | Depends on hardware | [ollama.com](https://ollama.com) — no key needed |
+| **Gemini** | ✅ Free tier | Fast | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | Anthropic | ❌ | Fast | [console.anthropic.com](https://console.anthropic.com) |
 | OpenAI | ❌ | Fast | [platform.openai.com](https://platform.openai.com) |
+| Custom | Depends | Depends | Any OpenAI-compatible API — set its URL/key in `/config` |
 
-After starting AIdex, type `/config` to enter your API key. Ollama runs
-fully on your own machine — ideal for low-end or offline devices, no
-internet or account required (install Ollama separately, then point
-AIdex at it).
+After starting AIdex, type `/config` to switch providers or enter an API
+key. Ollama runs fully on your own machine — ideal for low-end or
+offline devices, no internet or account required (install Ollama
+separately, then point AIdex at it).
 
 ---
 
@@ -146,7 +153,7 @@ AIdex at it).
 |---------|-------------|
 | `/help` | Show all commands |
 | `/config` | Configure API key, provider, model, workspace |
-| `/provider <name>` | Switch provider (openrouter/groq/anthropic/openai/ollama) |
+| `/provider <name>` | Switch provider (openrouter/groq/anthropic/openai/ollama/pollinations/gemini/custom) |
 | `/model <name>` | Switch AI model |
 | `/models` | List available models |
 | `/workspace <path>` | Set working directory |
@@ -168,7 +175,41 @@ AIdex at it).
 | `/disk [path]` | Show disk usage and directory size |
 | `/env` | Show Python/OS/architecture info |
 | `/which <name>` | Locate an executable on PATH |
+| `/image <prompt>` | Generate an image (free by default, no API key needed) |
+| `/ralph` | Show the Ralph task loop status |
+| `/ralph add <title>` | Add a task to the Ralph loop |
+| `/ralph run [n]` | Run the Ralph loop autonomously (default cap: 35 iterations) |
+| `/ralph clear` | Clear all Ralph tasks |
 | `/exit` | Exit AIdex |
+
+---
+
+## 🌀 Ralph: the autonomous task loop
+
+Add a list of tasks, then let AIdex work through them one at a time —
+each task gets its own focused turn with the agent, and progress is
+saved after every step so you can stop and resume later without losing
+anything.
+
+```
+/ralph add Build a login page
+/ralph add Write tests for it
+/ralph add Update the README
+/ralph run
+```
+
+- State lives in `<workspace>/ralph_tasks.json` — readable, editable by
+  hand if you want to reorder or rewrite a task.
+- `/ralph run [n]` caps the run at `n` iterations (default 35) as a
+  safety net against runaway loops; run it again to keep going.
+- Stopping (Ctrl+C in the terminal, or the Stop button on the web UI)
+  lets the current task finish before halting — nothing is cut off
+  mid-task.
+- Available identically in the plain TUI, the Rich TUI, and the web UI
+  (its own panel, with live streaming progress).
+- For safety, an autonomous Ralph run never gets shell/Python execution
+  or out-of-workspace file access through the web UI, same as a normal
+  web chat — see Safe Mode below.
 
 ---
 
@@ -210,6 +251,8 @@ The AI automatically calls these tools to perform real actions:
 | `git_branch` | List git branches |
 | `git_checkout` | Switch/create git branch |
 | `which` | Locate an executable on PATH |
+| `list_models` | Live model list with real pricing for any provider |
+| `generate_image` | Generate an image from a text prompt (free by default) |
 
 ---
 
@@ -254,16 +297,19 @@ aidex/
     ├── core/
     │   ├── agent.py      ← AI agent orchestrator, native tool-calling loop
     │   ├── config.py     ← Configuration manager
-    │   └── models.py     ← Live model registry (fetch/cache/fallback)
+    │   ├── models.py     ← Live model registry (fetch/cache/fallback)
+    │   ├── imagegen.py   ← Free image generation (Pollinations / custom)
+    │   └── ralph.py      ← Ralph autonomous task-loop orchestrator
     ├── providers/
-    │   └── base.py       ← OpenRouter, Groq, Anthropic, OpenAI, Ollama
+    │   └── base.py       ← OpenRouter, Groq, Anthropic, OpenAI, Ollama,
+    │                        Pollinations, Gemini, custom
     ├── tools/
-    │   └── file_tools.py ← All file/shell/git tools
+    │   └── file_tools.py ← All file/shell/git/image tools
     ├── tui/
     │   ├── app.py        ← Enhanced UI (Rich + prompt_toolkit)
     │   └── plain.py      ← Zero-dependency fallback UI (Python 2.7+)
     └── web/
-        ├── server.py     ← Stdlib-only local web server (REST + SSE chat)
+        ├── server.py     ← Stdlib-only local web server (REST + SSE chat + Ralph)
         └── static/       ← Browser UI (HTML/CSS/JS, no build step)
 ```
 

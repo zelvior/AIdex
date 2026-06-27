@@ -25,7 +25,7 @@ BANNER = """
  / __ | _/ // _  / -_) \\ /
 /_/ |_|/___/\\_,_/\\__/_\\_\\
 
-   AIdex AI Coding Agent — Installer v1.2.0
+   AIdex AI Coding Agent — Installer v1.3.0
 """
 
 def check_python():

@@ -3,10 +3,23 @@
 All notable changes to AIdex AI Coding Agent (formerly Nexus) will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [1.3.0] - 2026-06-27
 
 ### Added
 - `BRAIN.md` — a dense, single-file project-context document (architecture, the three shared-engine front ends, tool system, live model fallback chain, web security model, web API reference, compatibility constraints, and known design decisions). Intended to be read first instead of re-reading the whole codebase when picking the project back up.
+- **Free image generation, no API key needed by default** — new `generate_image` tool backed by Pollinations (free, no signup), available as a native function-calling tool, an `/image <prompt>` command in both TUIs, and a `POST /api/image` endpoint on the web (returns base64, with an optional `save_as`). Configured independently from the chat provider via `image_provider`/`image_model`.
+- **Two new chat providers**: `pollinations` (free, no key, now the **zero-config default** — a fresh install can chat AND generate images with no setup) and `gemini` (Google's OpenAI-compatible endpoint).
+- **`custom` provider** (chat) and **`custom` image backend** — point AIdex at any other OpenAI-compatible chat API or image API by supplying a base URL (and optional key) in config.
+- **Ralph TUI** — an autonomous task-loop orchestrator (`src/core/ralph.py`): add tasks, then run them one at a time with the agent until the list is empty, a safety cap is hit, or you stop it. Crash-safe JSON state persistence (atomic write+rename), resumable. Available via `/ralph`, `/ralph add <title>`, `/ralph run [max_iterations]`, `/ralph clear` in both TUIs, and a dedicated panel in the web UI (`GET/POST /api/ralph*`, SSE run stream). Pure stdlib, Python 2.7-compatible — runs under the plain TUI on Windows XP / 32-bit exactly like everything else there.
+- `config.needs_api_key()` / `config.has_usable_key()` — proper "is this provider ready to use" checks that correctly distinguish "no key required" (Pollinations, Ollama) from "key genuinely missing."
+
+### Fixed
+- **Real, exploitable bug**: several places (`agent.py`'s `_get_provider`, both TUIs' status displays, the web `/api/status`) used to treat `get_api_key()`'s truthy "not needed" sentinel as if a real key were configured. Fixed by switching every call site to the new `has_usable_key()`.
+- **Real, exploitable bug**: a tool's `output_path`-style parameter (e.g. `generate_image`) could write outside the configured workspace when invoked through web chat, even though direct file-browser endpoints were already confined — the AI deciding to pass an absolute path mid-conversation bypassed the per-endpoint checks entirely. Fixed with a second confinement layer inside `Agent._execute_tool()` itself (`confine_to_workspace`), threaded through `chat_stream()` and `RalphRunner`, so it covers every current and future file-writing tool regardless of which UI surface triggered it.
+- **Real bug**: two SSE streaming endpoints (`/api/chat`, `/api/ralph/run`) claimed `Connection: keep-alive` while sending an unbounded response with no `Content-Length`/chunked-encoding — ambiguous framing under HTTP/1.1 that could corrupt the next request reused on the same connection. Fixed by sending `Connection: close` and setting `close_connection = True`, which is the correct framing for this kind of response.
+- **Real bug, more severe in practice**: three POST handlers (`/api/ralph/clear`, `/api/ralph/stop`, the inline `/api/history/clear` branch) never read the request body even when the browser sent one, leaving leftover bytes in the socket buffer that got prepended onto the *next* request line on a reused connection — manifesting as a spurious `501 Unsupported method` on whatever request happened to follow. Only reproducible with genuine HTTP/1.1 connection reuse (a real browser, or Python's `http.client` with an explicit persistent connection) — isolated `curl` calls never showed it. Fixed by draining the body in all three handlers.
+- `/help`'s command table was silently swallowing any command containing literal `[brackets]` (e.g. `/disk [path]`, `/ralph run [n]`) because Rich interpreted them as markup tags. Fixed by wrapping cell content in `Text(...)`.
+- `run_python` now actually respects the configured safe-mode setting instead of a hardcoded default that ignored it.
 
 ## [1.2.0] - 2026-06-26
 

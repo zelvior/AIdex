@@ -43,6 +43,16 @@ const els = {
   streamToggle: $('#streamToggle'),
   maxTokensInput: $('#maxTokensInput'),
   temperatureInput: $('#temperatureInput'),
+
+  ralphCountsPill: $('#ralphCountsPill'),
+  ralphStopBtn: $('#ralphStopBtn'),
+  ralphClearBtn: $('#ralphClearBtn'),
+  ralphTaskInput: $('#ralphTaskInput'),
+  ralphAddBtn: $('#ralphAddBtn'),
+  ralphMaxIterations: $('#ralphMaxIterations'),
+  ralphRunBtn: $('#ralphRunBtn'),
+  ralphTaskList: $('#ralphTaskList'),
+  ralphLog: $('#ralphLog'),
 };
 
 const state = {
@@ -89,6 +99,7 @@ function activatePanel(name) {
   if (name === 'files' && state.fsPath) loadDirectory(state.fsPath);
   if (name === 'models') loadModels();
   if (name === 'settings') loadSettings();
+  if (name === 'ralph') loadRalphStatus();
 }
 
 $$('.rail-btn').forEach(btn => {
@@ -555,6 +566,185 @@ els.safeModeToggle.addEventListener('change', () => postJSON('/api/config', { sa
 els.streamToggle.addEventListener('change', () => postJSON('/api/config', { stream: els.streamToggle.checked }));
 els.maxTokensInput.addEventListener('change', () => postJSON('/api/config', { max_tokens: parseInt(els.maxTokensInput.value, 10) || 4096 }));
 els.temperatureInput.addEventListener('change', () => postJSON('/api/config', { temperature: parseFloat(els.temperatureInput.value) || 0.7 }));
+
+// ───────────────────────── Ralph panel ─────────────────────────
+
+function ralphStatusLabel(s) {
+  return { pending: 'pending', in_progress: 'running', done: 'done', failed: 'failed', skipped: 'skipped' }[s] || s;
+}
+
+function renderRalphTasks(tasks) {
+  els.ralphTaskList.innerHTML = '';
+  if (!tasks || tasks.length === 0) {
+    els.ralphTaskList.innerHTML = '<div class="muted pad">No tasks yet. Add one above.</div>';
+    return;
+  }
+  const iconChar = { pending: '○', in_progress: '●', done: '✓', failed: '✗', skipped: '–' };
+  for (const t of tasks) {
+    const row = document.createElement('div');
+    row.className = `ralph-task-row is-${t.status}`;
+    row.dataset.taskId = t.id;
+    row.innerHTML = `
+      <span class="ralph-task-icon"></span>
+      <div class="ralph-task-title">
+        <div></div>
+        <div class="ralph-task-notes"></div>
+      </div>`;
+    row.querySelector('.ralph-task-icon').textContent = iconChar[t.status] || '?';
+    row.querySelector('.ralph-task-title > div').textContent = `#${t.id} ${t.title}`;
+    if (t.notes) row.querySelector('.ralph-task-notes').textContent = t.notes.slice(0, 80);
+    els.ralphTaskList.appendChild(row);
+  }
+}
+
+function setRalphRunningUI(running) {
+  state.ralphRunning = running;
+  els.ralphRunBtn.disabled = running;
+  els.ralphStopBtn.hidden = !running;
+  els.ralphClearBtn.disabled = running;
+}
+
+async function loadRalphStatus() {
+  try {
+    const data = await getJSON('/api/ralph');
+    els.ralphCountsPill.textContent =
+      `${data.counts.pending} pending · ${data.counts.done} done · ${data.counts.failed} failed`;
+    renderRalphTasks(data.tasks);
+    setRalphRunningUI(data.running);
+  } catch (e) {
+    toast('Failed to load Ralph status: ' + e.message, true);
+  }
+}
+
+els.ralphAddBtn.addEventListener('click', async () => {
+  const title = els.ralphTaskInput.value.trim();
+  if (!title) return;
+  try {
+    await postJSON('/api/ralph/add', { title });
+    els.ralphTaskInput.value = '';
+    loadRalphStatus();
+  } catch (e) {
+    toast('Failed to add task: ' + e.message, true);
+  }
+});
+els.ralphTaskInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.ralphAddBtn.click();
+});
+
+els.ralphClearBtn.addEventListener('click', async () => {
+  try {
+    const data = await postJSON('/api/ralph/clear', {});
+    if (!data.ok) { toast(data.error || 'Failed to clear', true); return; }
+    els.ralphLog.innerHTML = '<div class="muted pad">Task output will stream here while the loop runs.</div>';
+    loadRalphStatus();
+  } catch (e) {
+    toast('Failed to clear: ' + e.message, true);
+  }
+});
+
+els.ralphStopBtn.addEventListener('click', async () => {
+  try {
+    const data = await postJSON('/api/ralph/stop', {});
+    toast(data.message || 'Stop requested');
+  } catch (e) {
+    toast('Failed to stop: ' + e.message, true);
+  }
+});
+
+function ralphLogAppend(html) {
+  if (els.ralphLog.querySelector('.muted.pad')) els.ralphLog.innerHTML = '';
+  const div = document.createElement('div');
+  div.innerHTML = html;
+  els.ralphLog.appendChild(div.firstElementChild || div);
+  els.ralphLog.scrollTop = els.ralphLog.scrollHeight;
+}
+
+els.ralphRunBtn.addEventListener('click', async () => {
+  if (state.ralphRunning) return;
+  const maxIterations = parseInt(els.ralphMaxIterations.value, 10) || 35;
+  setRalphRunningUI(true);
+  els.ralphLog.innerHTML = '';
+  let currentTextEl = null;
+
+  try {
+    const res = await fetch('/api/ralph/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_iterations: maxIterations }),
+    });
+    if (res.status === 409) {
+      const data = await res.json();
+      toast(data.error || 'A run is already in progress', true);
+      setRalphRunningUI(true); // something else is genuinely running
+      return;
+    }
+    if (!res.ok || !res.body) throw new Error('Stream failed to start (' + res.status + ')');
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let sep;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        let eventType = 'message', dataStr = '';
+        for (const line of rawEvent.split('\n')) {
+          if (line.startsWith('event:')) eventType = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+        }
+        if (!dataStr) continue;
+        let payload = {};
+        try { payload = JSON.parse(dataStr); } catch { continue; }
+
+        if (eventType === 'task_start') {
+          ralphLogAppend(`<div class="ralph-log-rule">Task ${payload.index}/${payload.total}: ${escapeHtml(payload.task.title)}</div>`);
+          currentTextEl = null;
+          renderRalphTasks((await getJSON('/api/ralph')).tasks);
+        } else if (eventType === 'text') {
+          if (!currentTextEl) {
+            currentTextEl = document.createElement('div');
+            currentTextEl.className = 'ralph-log-entry';
+            els.ralphLog.appendChild(currentTextEl);
+          }
+          currentTextEl.textContent += payload.text;
+          els.ralphLog.scrollTop = els.ralphLog.scrollHeight;
+        } else if (eventType === 'tool_call') {
+          ralphLogAppend(`<div class="ralph-log-entry ralph-log-tool">⚙ ${escapeHtml(payload.name)}(…)</div>`);
+          currentTextEl = null;
+        } else if (eventType === 'error') {
+          ralphLogAppend(`<div class="ralph-log-entry ralph-log-error">${escapeHtml(payload.message)}</div>`);
+          currentTextEl = null;
+        } else if (eventType === 'task_done') {
+          const label = payload.outcome === 'done' ? '✓ complete' : '✗ failed';
+          ralphLogAppend(`<div class="ralph-log-status">${label}: task #${payload.task.id}</div>`);
+          currentTextEl = null;
+          renderRalphTasks((await getJSON('/api/ralph')).tasks);
+        } else if (eventType === 'finished') {
+          const labels = {
+            completed: 'All tasks complete!',
+            max_iterations: 'Stopped: hit the iteration cap.',
+            stopped: 'Stopped by request.',
+            no_tasks: 'No tasks to run.',
+          };
+          ralphLogAppend(`<div class="ralph-log-status">${labels[payload.reason] || payload.reason}</div>`);
+          toast(labels[payload.reason] || payload.reason);
+        }
+      }
+    }
+  } catch (err) {
+    ralphLogAppend(`<div class="ralph-log-entry ralph-log-error">${escapeHtml(err.message || String(err))}</div>`);
+    toast('Ralph run error: ' + (err.message || err), true);
+  } finally {
+    setRalphRunningUI(false);
+    loadRalphStatus();
+  }
+});
 
 // ───────────────────────── Boot ─────────────────────────
 

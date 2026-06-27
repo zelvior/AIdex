@@ -20,6 +20,7 @@ from src.tools.file_tools import (
     git_status, git_diff, git_log, git_add, git_commit, git_init, git_branch, git_checkout,
     analyze_project, get_file_info, read_file_lines, head_file, tail_file,
     count_lines, disk_usage, env_info, find_replace_in_files, which,
+    generate_image,
     TOOL_DEFINITIONS, ToolResult
 )
 
@@ -101,6 +102,19 @@ def normalize_message_content(msg: Dict) -> str:
     return content or ""
 
 
+def _path_within(path: str, workspace: str) -> bool:
+    """True if `path` (absolute or relative) resolves to inside `workspace`.
+    Same logic as the web server's _is_within_workspace — kept here too so
+    the agent itself can enforce confinement per-session (e.g. for web
+    chat) regardless of which tool or parameter name is doing the writing,
+    rather than relying on each new web endpoint to remember to check."""
+    import os as _os
+    ws_abs = _os.path.realpath(_os.path.abspath(workspace))
+    target = path if _os.path.isabs(path) else _os.path.join(ws_abs, path)
+    target_abs = _os.path.realpath(_os.path.abspath(target))
+    return target_abs == ws_abs or target_abs.startswith(ws_abs + _os.sep)
+
+
 class Agent:
     def __init__(self):
         self.messages: List[Dict] = []
@@ -118,7 +132,7 @@ class Agent:
 
     def _get_provider(self):
         api_key = config.get_api_key()
-        if not api_key and config.provider != "ollama":
+        if not config.has_usable_key():
             raise ProviderError(
                 f"No API key set for provider '{config.provider}'. "
                 "Use /config to set your API key."
@@ -192,6 +206,15 @@ class Agent:
         if tool_name in getattr(self, "_excluded_tools", set()):
             return ToolResult(False, "", f"Tool '{tool_name}' is disabled for this session.")
 
+        confine = getattr(self, "_confine_to_workspace", False)
+        if confine:
+            ws_check = config.workspace
+            for key in ("path", "file", "directory", "output_path"):
+                val = params.get(key)
+                if isinstance(val, str) and val:
+                    if not _path_within(val, ws_check):
+                        return ToolResult(False, "", f"Path '{val}' is outside the workspace and was blocked for this session.")
+
         ws = config.workspace
         safe = config.get("safe_mode", True)
 
@@ -233,6 +256,10 @@ class Agent:
             "list_models": lambda p: self._list_models_tool(
                 p.get("provider"), bool(p.get("free_only", False)), bool(p.get("refresh", False))
             ),
+            "generate_image": lambda p: generate_image(
+                p["prompt"], ws, p.get("output_path", ""),
+                int(p.get("width", 1024)), int(p.get("height", 1024)), p.get("seed")
+            ),
         }
 
         fn = dispatch.get(tool_name)
@@ -245,7 +272,8 @@ class Agent:
         except Exception as e:
             return ToolResult(False, "", f"Tool error: {e}")
 
-    def chat_stream(self, user_input: str, excluded_tools: Optional[set] = None) -> Iterator[Tuple[str, str]]:
+    def chat_stream(self, user_input: str, excluded_tools: Optional[set] = None,
+                     confine_to_workspace: bool = False) -> Iterator[Tuple[str, str]]:
         """
         Stream a response. Yields (type, content) tuples:
           ("text", chunk)       - AI text
@@ -276,6 +304,7 @@ class Agent:
         native = getattr(provider, "supports_native_tools", False)
         is_anthropic = provider.__class__.__name__ == "AnthropicProvider"
         self._excluded_tools = excluded_tools or set()
+        self._confine_to_workspace = confine_to_workspace
         if native:
             from src.tools.file_tools import build_anthropic_tools_schema, build_openai_tools_schema
             tools_schema = build_anthropic_tools_schema() if is_anthropic else build_openai_tools_schema()

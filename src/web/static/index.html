@@ -32,6 +32,10 @@
         <svg viewBox="0 0 24 24" class="icon"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 7v5l3.2 3.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
         <span>Models</span>
       </button>
+      <button class="rail-btn" data-panel="ralph" type="button">
+        <svg viewBox="0 0 24 24" class="icon"><path d="M5 7h14M5 12h14M5 17h8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="20" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+        <span>Ralph</span>
+      </button>
       <button class="rail-btn" data-panel="settings" type="button">
         <svg viewBox="0 0 24 24" class="icon"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v2.4M12 18.6V21M21 12h-2.4M5.4 12H3M18 6l-1.6 1.6M7.6 16.4 6 18M18 18l-1.6-1.6M7.6 7.6 6 6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
         <span>Settings</span>
@@ -144,6 +148,40 @@
           <tr><td colspan="5" class="muted pad">Loading live models…</td></tr>
         </tbody>
       </table>
+    </div>
+  </section>
+
+  <!-- ───────────────────────── Ralph panel ───────────────────────── -->
+  <section class="panel panel-ralph" id="panel-ralph" aria-label="Ralph task loop">
+    <header class="panel-header">
+      <div class="header-left">
+        <span class="panel-title">Ralph</span>
+        <span class="source-pill" id="ralphCountsPill">—</span>
+      </div>
+      <div class="header-right">
+        <button class="ghost-btn" id="ralphStopBtn" type="button" hidden>Stop</button>
+        <button class="ghost-btn" id="ralphClearBtn" type="button">Clear</button>
+      </div>
+    </header>
+
+    <div class="ralph-toolbar">
+      <input id="ralphTaskInput" class="text-input" type="text" placeholder="Add a task…" autocomplete="off">
+      <button class="ghost-btn" id="ralphAddBtn" type="button">Add</button>
+      <span class="ralph-toolbar-spacer"></span>
+      <label class="field-label" for="ralphMaxIterations">Max iterations</label>
+      <input id="ralphMaxIterations" class="text-input small" type="number" min="1" max="200" value="35">
+      <button class="send-btn ralph-run-btn" id="ralphRunBtn" type="button" title="Run the task loop">
+        <svg viewBox="0 0 24 24" class="icon"><path d="M7 5l11 7-11 7V5z" fill="currentColor"/></svg>
+      </button>
+    </div>
+
+    <div class="ralph-body">
+      <aside class="ralph-tasks" id="ralphTaskList">
+        <div class="muted pad">No tasks yet. Add one above.</div>
+      </aside>
+      <div class="ralph-log" id="ralphLog">
+        <div class="muted pad">Task output will stream here while the loop runs.</div>
+      </div>
     </div>
   </section>
 

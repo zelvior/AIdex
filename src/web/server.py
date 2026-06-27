@@ -26,6 +26,9 @@ Endpoints:
   GET  /api/fs/list?path=      -> directory listing for the in-browser file browser
   GET  /api/fs/read?path=      -> file content for the in-browser file viewer/editor
   POST /api/fs/write           -> {path, content} save a file from the editor
+  GET  /api/image-providers    -> available image-generation backends
+  POST /api/image               -> {prompt, width?, height?, seed?} generate an image,
+                                    returns it inline as base64 (free by default, no key needed)
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ import os
 import sys
 import json
 import time
+import base64
 import threading
 import socket
 import webbrowser
@@ -49,8 +53,9 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from src.core.config import config, PROVIDERS  # noqa: E402
+from src.core.config import config, PROVIDERS, IMAGE_PROVIDERS  # noqa: E402
 from src.core.agent import agent, normalize_message_content  # noqa: E402
+from src.core.imagegen import ImageGenError  # noqa: E402
 from src.tools.file_tools import TOOL_DEFINITIONS, list_directory_flat, read_file_raw, write_file  # noqa: E402
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -106,9 +111,26 @@ def _is_within_workspace(path: str, workspace: str) -> bool:
 # only, single-user setup).
 _SHELL_TOOLS = {"run_command", "run_python"}
 
+# RalphState/RalphRunner live at module level (not per-Handler-instance,
+# since http.server creates a fresh Handler for every request) so a task
+# list and an in-progress run persist across the separate HTTP requests
+# that add tasks, start a run, and stop it.
+_ralph_state = None
+_ralph_runner = None
+_ralph_lock = threading.Lock()
+
+
+def _get_ralph_state():
+    global _ralph_state
+    if _ralph_state is None:
+        from src.core.ralph import RalphState, default_tasks_path
+        _ralph_state = RalphState(default_tasks_path(config.workspace))
+        _ralph_state.load()
+    return _ralph_state
+
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "AIdex/1.2"
+    server_version = "AIdex/1.3"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -180,6 +202,10 @@ class Handler(BaseHTTPRequestHandler):
             self._api_fs_list(qs)
         elif path == "/api/fs/read":
             self._api_fs_read(qs)
+        elif path == "/api/image-providers":
+            self._api_image_providers()
+        elif path == "/api/ralph":
+            self._api_ralph_status()
         else:
             self.send_error(404, "Not found")
 
@@ -194,12 +220,23 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/config":
             self._api_set_config()
         elif path == "/api/history/clear":
+            self._read_json_body()  # drain the body — see _api_ralph_clear's comment
             agent.clear_history()
             self._send_json({"ok": True})
         elif path == "/api/tool":
             self._api_run_tool()
         elif path == "/api/fs/write":
             self._api_fs_write()
+        elif path == "/api/image":
+            self._api_generate_image()
+        elif path == "/api/ralph/add":
+            self._api_ralph_add()
+        elif path == "/api/ralph/run":
+            self._api_ralph_run_stream()
+        elif path == "/api/ralph/stop":
+            self._api_ralph_stop()
+        elif path == "/api/ralph/clear":
+            self._api_ralph_clear()
         else:
             self.send_error(404, "Not found")
 
@@ -213,7 +250,7 @@ class Handler(BaseHTTPRequestHandler):
             "model": config.model,
             "workspace": config.workspace,
             "safe_mode": bool(config.get("safe_mode", True)),
-            "has_key": bool(config.get_api_key()),
+            "has_key": config.has_usable_key(),
             "message_count": len(agent.messages),
             "providers": list(PROVIDERS.keys()),
         })
@@ -324,6 +361,191 @@ class Handler(BaseHTTPRequestHandler):
         result = write_file(path, content, config.workspace)
         self._send_json({"ok": result.success, "output": result.output, "error": result.error})
 
+    def _api_image_providers(self):
+        self._send_json({
+            "current": config.get("image_provider", "pollinations"),
+            "providers": [
+                {"id": pid, "name": info["name"], "requires_key": info.get("requires_key", True),
+                 "models": info.get("models", [])}
+                for pid, info in IMAGE_PROVIDERS.items()
+            ],
+        })
+
+    def _api_generate_image(self):
+        data = self._read_json_body()
+        prompt = data.get("prompt", "")
+        if not prompt:
+            self._send_json({"ok": False, "error": "prompt is required"}, status=400)
+            return
+        width = int(data.get("width", 1024))
+        height = int(data.get("height", 1024))
+        seed = data.get("seed")
+        save_as = data.get("save_as", "")
+
+        if save_as and not _is_within_workspace(save_as, config.workspace):
+            self._send_json({"ok": False, "error": "Path is outside the workspace"}, status=403)
+            return
+
+        try:
+            result = config.generate_image(prompt, width=width, height=height, seed=seed)
+        except ImageGenError as e:
+            self._send_json({"ok": False, "error": str(e)}, status=502)
+            return
+        except Exception as e:
+            self._send_json({"ok": False, "error": f"Unexpected error: {e}"}, status=500)
+            return
+
+        saved_path = None
+        if save_as:
+            full = os.path.join(config.workspace, save_as) if not os.path.isabs(save_as) else save_as
+            try:
+                os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+                with open(full, "wb") as f:
+                    f.write(result.data)
+                saved_path = save_as
+            except OSError as e:
+                self._send_json({"ok": False, "error": f"Generated but failed to save: {e}"}, status=500)
+                return
+
+        self._send_json({
+            "ok": True,
+            "image_base64": base64.b64encode(result.data).decode("ascii"),
+            "content_type": result.content_type,
+            "filename": result.suggested_filename(),
+            "saved_path": saved_path,
+        })
+
+    def _api_ralph_status(self):
+        state = _get_ralph_state()
+        self._send_json({
+            "tasks": [t.to_dict() for t in state.tasks],
+            "counts": state.counts(),
+            "iteration": state.iteration,
+            "paused": state.paused,
+            "running": _ralph_runner is not None,
+            "tasks_path": state.tasks_path,
+        })
+
+    def _api_ralph_add(self):
+        data = self._read_json_body()
+        title = data.get("title", "").strip()
+        if not title:
+            self._send_json({"ok": False, "error": "title is required"}, status=400)
+            return
+        state = _get_ralph_state()
+        task = state.add_task(title)
+        state.save()
+        self._send_json({"ok": True, "task": task.to_dict()})
+
+    def _api_ralph_clear(self):
+        global _ralph_runner
+        self._read_json_body()  # drain the request body even though unused —
+        # otherwise leftover bytes sit in the socket buffer and corrupt the
+        # next request's parsing on this reused HTTP/1.1 connection (this
+        # was a real, confirmed bug: a stray "{}" prefixed onto the
+        # following request line caused a spurious 501).
+        if _ralph_runner is not None:
+            self._send_json({"ok": False, "error": "Cannot clear while a run is in progress — stop it first"}, status=409)
+            return
+        state = _get_ralph_state()
+        state.tasks = []
+        state.iteration = 0
+        state.save()
+        self._send_json({"ok": True})
+
+    def _api_ralph_stop(self):
+        global _ralph_runner
+        self._read_json_body()  # drain the body — see _api_ralph_clear's comment
+        with _ralph_lock:
+            if _ralph_runner is not None:
+                _ralph_runner.request_stop()
+                self._send_json({"ok": True, "message": "Stop requested — will stop after the current task."})
+            else:
+                self._send_json({"ok": True, "message": "No run in progress."})
+
+    def _api_ralph_run_stream(self):
+        """SSE stream of an autonomous Ralph run, mirroring /api/chat's
+        event shape (text/tool_call/tool_result/error) plus Ralph-specific
+        events (task_start, task_done, finished) so the frontend can render
+        per-task progress without a different protocol to learn."""
+        global _ralph_runner
+        from src.core.ralph import RalphRunner, DEFAULT_MAX_ITERATIONS
+
+        data = self._read_json_body()
+        max_iterations = int(data.get("max_iterations", DEFAULT_MAX_ITERATIONS))
+
+        with _ralph_lock:
+            if _ralph_runner is not None:
+                self._send_json({"error": "A Ralph run is already in progress"}, status=409)
+                return
+            state = _get_ralph_state()
+            # confine_to_workspace mirrors the same gating /api/chat uses —
+            # an autonomous loop calling tools unattended is exactly the
+            # case that protection exists for, even more so than a single
+            # chat turn a person is watching live.
+            excluded = set() if config.get("web_allow_shell_tools", False) else _SHELL_TOOLS
+            runner = RalphRunner(agent, state, max_iterations=max_iterations,
+                                  excluded_tools=excluded, confine_to_workspace=True)
+            _ralph_runner = runner
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        # Deliberately close rather than keep-alive: this handler streams
+        # an unknown number of bytes with no Content-Length and no chunked
+        # transfer-encoding, so the only framing-safe way to tell the
+        # client (and this stdlib HTTP/1.1 persistent-connection server)
+        # the response is actually finished is to close the connection.
+        # Claiming keep-alive here was a real bug: the next request reused
+        # on the same socket would arrive while the previous response's
+        # framing was still ambiguous, corrupting it (manifested as a
+        # browser-side "Unsupported method" 501 on the very next fetch).
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.close_connection = True
+
+        def emit(event_type, payload):
+            try:
+                chunk = "event: %s\ndata: %s\n\n" % (event_type, json.dumps(payload))
+                self.wfile.write(chunk.encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                raise StopIteration
+
+        def on_task_start(task, index, total):
+            emit("task_start", {"task": task.to_dict(), "index": index, "total": total})
+
+        def on_task_event(task, etype, content):
+            if etype == "text":
+                emit("text", {"text": content})
+            elif etype == "tool_call":
+                emit("tool_call", {"name": content})
+            elif etype == "tool_result":
+                emit("tool_result", {"output": content})
+            elif etype == "error":
+                emit("error", {"message": content})
+
+        def on_task_done(task, outcome):
+            emit("task_done", {"task": task.to_dict(), "outcome": outcome})
+
+        def on_finished(reason):
+            emit("finished", {"reason": reason})
+
+        try:
+            runner.run(on_task_start=on_task_start, on_task_event=on_task_event,
+                       on_task_done=on_task_done, on_finished=on_finished)
+        except StopIteration:
+            pass
+        except Exception as e:
+            try:
+                emit("error", {"message": "Unexpected server error: %s" % e})
+            except StopIteration:
+                pass
+        finally:
+            with _ralph_lock:
+                _ralph_runner = None
+
     def _api_run_tool(self):
         data = self._read_json_body()
         tool_name = data.get("tool", "")
@@ -337,7 +559,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Any tool param that looks like a workspace-relative path must stay
         # inside the workspace when invoked from the web UI.
-        for key in ("path", "file", "directory"):
+        for key in ("path", "file", "directory", "output_path"):
             if key in params and isinstance(params[key], str) and not _is_within_workspace(params[key], config.workspace):
                 self._send_json({"ok": False, "output": "", "error": "Path is outside the workspace"}, status=403)
                 return
@@ -355,9 +577,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # Deliberately close rather than keep-alive — same fix and same
+        # reasoning as _api_ralph_run_stream: an unbounded streamed
+        # response with no Content-Length/chunked-encoding is ambiguously
+        # framed under HTTP/1.1 keep-alive, and the next request reused on
+        # the same connection can arrive corrupted. See that method's
+        # comment for the full explanation; this endpoint had the exact
+        # same bug.
+        self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
+        self.close_connection = True
 
         def emit(event_type, payload):
             try:
@@ -369,7 +599,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             excluded = set() if config.get("web_allow_shell_tools", False) else _SHELL_TOOLS
-            for typ, content in agent.chat_stream(user_input, excluded_tools=excluded):
+            for typ, content in agent.chat_stream(user_input, excluded_tools=excluded, confine_to_workspace=True):
                 if typ == "text":
                     emit("text", {"text": content})
                 elif typ == "tool_call":

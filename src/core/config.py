@@ -45,14 +45,19 @@ MODELS_CACHE_DIR = CONFIG_DIR / "models_cache"
 _LEGACY_CONFIG_FILE = _legacy_config_dir() / "config.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "provider": "openrouter",
-    "model": "openai/gpt-3.5-turbo",
+    "provider": "pollinations",
+    "model": "openai",
     "openrouter_api_key": "",
     "groq_api_key": "",
     "anthropic_api_key": "",
     "openai_api_key": "",
     "ollama_api_key": "local",
     "ollama_base_url": "http://localhost:11434/v1",
+    "gemini_api_key": "",
+    "pollinations_api_key": "",
+    "custom_api_key": "",
+    "custom_base_url": "",
+    "custom_chat_model": "",
     "theme": "dark",
     "max_tokens": 4096,
     "temperature": 0.7,
@@ -67,6 +72,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "web_allow_shell_tools": False,
     "request_timeout": 60,
     "max_retries": 2,
+    # Image generation is configured independently of chat — e.g. you can
+    # chat via OpenRouter and still generate images via Pollinations (the
+    # zero-config default) without switching your chat provider.
+    "image_provider": "pollinations",
+    "image_model": "flux",
+    "image_api_key": "",
+    "image_base_url": "",
 }
 
 PROVIDERS = {
@@ -137,6 +149,7 @@ PROVIDERS = {
         "name": "Ollama (Local)",
         "base_url": "http://localhost:11434/v1",
         "key_field": "ollama_api_key",
+        "requires_key": False,
         "free_models": [
             "llama3.2:1b",
             "llama3.2",
@@ -146,6 +159,69 @@ PROVIDERS = {
             "gemma2:2b",
         ],
         "paid_models": [],
+    },
+    "pollinations": {
+        # No API key required for normal use — free, no signup, generous
+        # quota. This is AIdex's zero-config default: a brand new user can
+        # chat AND generate images without ever opening /config.
+        # https://github.com/pollinations/pollinations
+        "name": "Pollinations (Free, No Key Needed)",
+        "base_url": "https://gen.pollinations.ai/v1",
+        "key_field": "pollinations_api_key",
+        "requires_key": False,
+        "free_models": [
+            "openai",
+            "openai-fast",
+            "mistral",
+            "llama",
+            "deepseek",
+            "qwen-coder",
+        ],
+        "paid_models": [],
+    },
+    "gemini": {
+        "name": "Google Gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "key_field": "gemini_api_key",
+        "free_models": [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+        ],
+        "paid_models": [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+        ],
+    },
+    "custom": {
+        # User-defined OpenAI-compatible endpoint — covers literally any
+        # provider with a /chat/completions-shaped API that isn't already
+        # built in (self-hosted, a company gateway, a new provider, etc.)
+        "name": "Custom (Any OpenAI-Compatible API)",
+        "base_url": "",  # filled in from config.custom_base_url at use time
+        "key_field": "custom_api_key",
+        "free_models": [],
+        "paid_models": [],
+    },
+}
+
+# Image generation providers — separate registry from chat PROVIDERS above,
+# since the image backend is configured independently (you might chat via
+# OpenRouter but still generate images via the free Pollinations default).
+IMAGE_PROVIDERS = {
+    "pollinations": {
+        # Free, unlimited for normal use, no signup or key required.
+        # GET https://image.pollinations.ai/prompt/{prompt}?model=&width=&height=&seed=&nologo=
+        "name": "Pollinations (Free, No Key Needed)",
+        "base_url": "https://image.pollinations.ai/prompt",
+        "key_field": "image_api_key",
+        "requires_key": False,
+        "models": ["flux", "turbo", "kontext", "gptimage", "seedream", "nanobanana"],
+    },
+    "custom": {
+        "name": "Custom (Any Image API)",
+        "base_url": "",
+        "key_field": "image_api_key",
+        "models": [],
     },
 }
 
@@ -197,12 +273,27 @@ class Config:
         self.save()
 
     def get_api_key(self, provider: Optional[str] = None) -> str:
-        p = provider or self._data.get("provider", "openrouter")
+        p = provider or self._data.get("provider", "pollinations")
         field = PROVIDERS.get(p, {}).get("key_field", "")
         key = self._data.get(field, "")
-        if p == "ollama" and not key:
-            return "local"
+        if not key and not PROVIDERS.get(p, {}).get("requires_key", True):
+            return "not-needed"
         return key
+
+    def needs_api_key(self, provider: Optional[str] = None) -> bool:
+        """True if this provider actually requires a key to be set (as
+        opposed to ones like Pollinations/Ollama that work with none)."""
+        p = provider or self._data.get("provider", "pollinations")
+        return bool(PROVIDERS.get(p, {}).get("requires_key", True))
+
+    def has_usable_key(self, provider: Optional[str] = None) -> bool:
+        """True if this provider is ready to use right now — either it
+        doesn't need a key, or a real key has been set."""
+        p = provider or self._data.get("provider", "pollinations")
+        if not self.needs_api_key(p):
+            return True
+        field = PROVIDERS.get(p, {}).get("key_field", "")
+        return bool(self._data.get(field, ""))
 
     def set_api_key(self, provider: str, key: str):
         field = PROVIDERS.get(provider, {}).get("key_field", "")
@@ -211,10 +302,12 @@ class Config:
             self.save()
 
     def get_provider_info(self, provider: Optional[str] = None) -> Dict:
-        p = provider or self._data.get("provider", "openrouter")
-        info = dict(PROVIDERS.get(p, PROVIDERS["openrouter"]))
+        p = provider or self._data.get("provider", "pollinations")
+        info = dict(PROVIDERS.get(p, PROVIDERS["pollinations"]))
         if p == "ollama":
             info["base_url"] = self._data.get("ollama_base_url", info["base_url"])
+        elif p == "custom":
+            info["base_url"] = self._data.get("custom_base_url", "")
         return info
 
     def all_models(self, provider: Optional[str] = None) -> list:
@@ -246,13 +339,34 @@ class Config:
         from src.core.models import cache_age_label
         return cache_age_label(MODELS_CACHE_DIR, provider or self.provider)
 
+    def get_image_provider_info(self, provider: Optional[str] = None) -> Dict:
+        p = provider or self.get("image_provider", "pollinations")
+        info = dict(IMAGE_PROVIDERS.get(p, IMAGE_PROVIDERS["pollinations"]))
+        if p == "custom":
+            info["base_url"] = self.get("image_base_url", "")
+        return info
+
+    def generate_image(self, prompt: str, width: int = 1024, height: int = 1024,
+                        seed: Optional[int] = None, timeout: Optional[int] = None):
+        """Generate an image using the configured image provider — free
+        Pollinations by default, no API key or setup required."""
+        from src.core.imagegen import generate_image as _generate_image
+        p = self.get("image_provider", "pollinations")
+        info = self.get_image_provider_info(p)
+        api_key = self.get(info.get("key_field", "image_api_key"), "")
+        model = self.get("image_model", "flux")
+        return _generate_image(
+            prompt, p, info["base_url"], api_key, model, width, height, seed,
+            timeout=timeout or int(self.get("request_timeout", 60)),
+        )
+
     @property
     def provider(self) -> str:
-        return self._data.get("provider", "openrouter")
+        return self._data.get("provider", "pollinations")
 
     @property
     def model(self) -> str:
-        return self._data.get("model", "openai/gpt-3.5-turbo")
+        return self._data.get("model", "openai")
 
     @property
     def workspace(self) -> str:

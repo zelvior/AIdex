@@ -654,6 +654,25 @@ def which(name: str) -> ToolResult:
         return ToolResult(False, "", str(e))
 
 
+def generate_image(prompt: str, workspace: str = ".", output_path: str = "",
+                    width: int = 1024, height: int = 1024, seed: int = None) -> ToolResult:
+    """Generate an image from a text prompt and save it to the workspace.
+    Uses the configured image provider — free Pollinations by default, no
+    API key or setup required (see config.generate_image())."""
+    try:
+        from src.core.config import config
+        result = config.generate_image(prompt, width=width, height=height, seed=seed)
+        fname = output_path or result.suggested_filename()
+        full = _resolve(fname, workspace)
+        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+        with open(full, "wb") as f:
+            f.write(result.data)
+        size = len(result.data)
+        return ToolResult(True, f"✓ Image generated and saved to {fname} ({_human_size(size)}, {width}x{height})")
+    except Exception as e:
+        return ToolResult(False, "", f"Image generation failed: {e}")
+
+
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 def _resolve(path: str, workspace: str) -> str:
@@ -918,6 +937,17 @@ TOOL_DEFINITIONS = [
             "provider": "str - provider name (default: current provider)",
             "free_only": "bool - only show free models (default: false)",
             "refresh": "bool - force a fresh fetch, bypassing cache (default: false)",
+        },
+    },
+    {
+        "name": "generate_image",
+        "description": "Generate an image from a text prompt and save it to the workspace. Uses the configured image provider — free, no API key needed by default.",
+        "parameters": {
+            "prompt": "str - description of the image to generate",
+            "output_path": "str - filename to save as, default: auto-generated from prompt",
+            "width": "int - image width in pixels, default: 1024",
+            "height": "int - image height in pixels, default: 1024",
+            "seed": "int - seed for reproducible results, default: random",
         },
     },
 ]
